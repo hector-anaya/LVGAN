@@ -340,3 +340,197 @@ def save_video(frames, output_path, fps=15):
 
     out.release()
     print(f"Saved video to {output_path}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CHECKPOINT HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _rmtree(path):
+    try:
+        shutil.rmtree(path)
+        print(f'[CKPT] Removed old checkpoint → {path}')
+    except Exception as e:
+        print(f'[CKPT] Warning: could not remove {path}: {e}')
+
+
+def _warm_up_generator(gen, n_frames, frame_size=(256, 256)):
+    """One dummy forward pass so Keras creates all weight tensors."""
+    dummy = tf.zeros((n_frames, frame_size[0], frame_size[1], 3))
+    gen(n=n_frames, og_frames=dummy,
+        noise=tf.zeros((1, 400)), training=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  GAN CHECKPOINT MANAGER
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GANCheckpointManager:
+    """
+    Handles periodic saving and full restoration of a fixed-frame GAN
+    training run with DUAL discriminators (3D video + 2D frame).
+
+    Parameters
+    ----------
+    folder          : experiment root (checkpoints written to folder/checkpoints/)
+    generator       : LatentARLTCGAN instance
+    discriminator   : 3D video discriminator
+    discriminator2  : 2D frame discriminator
+    gen_opt         : generator Adam optimiser
+    disc_opt        : 3D discriminator Adam optimiser
+    disc2_opt       : 2D discriminator Adam optimiser
+    n_frames        : fixed frame count used for the entire run
+    build_disc_fn   : callable() -> fresh 3D disc model
+    build_disc2_fn  : callable() -> fresh 2D frame disc model
+    save_every      : save a checkpoint every this many global steps
+    keep_last       : number of recent checkpoints to keep on disk
+    """
+
+    _SIDECAR = 'state.json'
+
+    def __init__(self,
+                 folder,
+                 generator,
+                 discriminator,
+                 gen_opt,
+                 disc_opt,
+                 n_frames,
+                 build_disc_fn,
+                 discriminator2=None,
+                 disc2_opt=None,
+                 build_disc2_fn=None,
+                 save_every=500,
+                 keep_last=3):
+        self.folder         = folder
+        self.ckpt_dir       = os.path.join(folder, 'checkpoints')
+        self.gen            = generator
+        self.disc           = discriminator
+        self.disc2          = discriminator2
+        self.gen_opt        = gen_opt
+        self.disc_opt       = disc_opt
+        self.disc2_opt      = disc2_opt
+        self.n_frames       = n_frames
+        self.build_disc_fn  = build_disc_fn
+        self.build_disc2_fn = build_disc2_fn
+        self.save_every     = save_every
+        self.keep_last      = keep_last
+        self._saved_steps   = []
+
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def step(self, z: int, epoch: int):
+        """Call once per training step (after losses are computed)."""
+        if z > 0 and z % self.save_every == 0:
+            self.save(z, epoch)
+
+    def save(self, z: int, epoch: int):
+        """Force-save a checkpoint right now."""
+        tag      = f'step_{z:07d}'
+        step_dir = os.path.join(self.ckpt_dir, tag)
+        os.makedirs(step_dir, exist_ok=True)
+
+        # ── 1. model weights ─────────────────────────────────────────────────
+        self.gen.save_weights(
+            os.path.join(step_dir, 'generator.weights.h5'))
+        self.disc.save_weights(
+            os.path.join(step_dir, 'discriminator.weights.h5'))
+        if self.disc2 is not None:
+            self.disc2.save_weights(
+                os.path.join(step_dir, 'discriminator2d.weights.h5'))
+
+        # ── 2. tf.train.Checkpoint (optimizer slot variables) ────────────────
+        ckpt_kwargs = {'gen_opt': self.gen_opt, 'disc_opt': self.disc_opt}
+        if self.disc2_opt is not None:
+            ckpt_kwargs['disc2_opt'] = self.disc2_opt
+        tf_ckpt = tf.train.Checkpoint(**ckpt_kwargs)
+        tf_ckpt.write(os.path.join(step_dir, 'optimizers'))
+
+        # ── 3. training state (JSON sidecar) ─────────────────────────────────
+        state = {
+            'z'       : z,
+            'epoch'   : epoch,
+            'n_frames': self.n_frames,
+            'gen_lr'  : float(self.gen_opt.learning_rate),
+            'disc_lr' : float(self.disc_opt.learning_rate),
+        }
+        if self.disc2_opt is not None:
+            state['disc2_lr'] = float(self.disc2_opt.learning_rate)
+        with open(os.path.join(step_dir, self._SIDECAR), 'w') as f:
+            json.dump(state, f, indent=2)
+
+        print(f'[CKPT] Saved checkpoint → {step_dir}')
+
+        # ── 4. rolling cleanup ───────────────────────────────────────────────
+        self._saved_steps.append(z)
+        if len(self._saved_steps) > self.keep_last:
+            old_z   = self._saved_steps.pop(0)
+            old_dir = os.path.join(self.ckpt_dir, f'step_{old_z:07d}')
+            _rmtree(old_dir)
+
+    def restore_if_available(self, frame_size=(256, 256)):
+        """
+        Scan checkpoint dir for the latest checkpoint and restore everything.
+
+        Returns (start_z, start_epoch) — both 0 if no checkpoint exists.
+        """
+        latest = self._find_latest_checkpoint()
+        if latest is None:
+            print('[CKPT] No checkpoint found — starting from scratch.')
+            return 0, 0,None,None
+
+        print(f'[CKPT] Restoring from {latest}')
+
+        with open(os.path.join(latest, self._SIDECAR)) as f:
+            state = json.load(f)
+
+        # ── learning rates ───────────────────────────────────────────────────
+        self.gen_opt.learning_rate.assign(state['gen_lr'])
+        self.disc_opt.learning_rate.assign(state['disc_lr'])
+        if self.disc2_opt is not None:
+            self.disc2_opt.learning_rate.assign(
+                state.get('disc2_lr', state['disc_lr']))
+
+        # ── generator weights ────────────────────────────────────────────────
+        _warm_up_generator(self.gen, self.n_frames, frame_size=frame_size)
+        self.gen.load_weights(os.path.join(latest, 'generator.weights.h5'))
+
+        # ── primary discriminator ────────────────────────────────────────────
+        new_disc = self.build_disc_fn()
+        new_disc.load_weights(os.path.join(latest, 'discriminator.weights.h5'))
+        self.disc = new_disc
+
+        # ── secondary discriminator (optional) ───────────────────────────────
+        if self.build_disc2_fn is not None:
+            new_disc2 = self.build_disc2_fn()
+            disc2_path = os.path.join(latest, 'discriminator2d.weights.h5')
+            if os.path.exists(disc2_path):
+                new_disc2.load_weights(disc2_path)
+            else:
+                print('[CKPT] WARNING: no 2D disc weights — starting 2D disc from scratch.')
+            self.disc2 = new_disc2
+
+        # ── optimiser slot variables ─────────────────────────────────────────
+        ckpt_kwargs = {'gen_opt': self.gen_opt, 'disc_opt': self.disc_opt}
+        if self.disc2_opt is not None:
+            ckpt_kwargs['disc2_opt'] = self.disc2_opt
+        tf_ckpt = tf.train.Checkpoint(**ckpt_kwargs)
+        tf_ckpt.read(os.path.join(latest, 'optimizers')).expect_partial()
+
+        z, epoch = state['z'], state['epoch']
+        print(f'[CKPT] Restored  z={z}  epoch={epoch}  n_frames={self.n_frames}')
+        return z + 1, epoch,self.gen,self.disc  # resume from NEXT step
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _find_latest_checkpoint(self):
+        """Return the path of the checkpoint with the highest step number."""
+        dirs = [
+            d for d in _glob.glob(os.path.join(self.ckpt_dir, 'step_*'))
+            if os.path.isdir(d) and
+               os.path.exists(os.path.join(d, self._SIDECAR))
+        ]
+        if not dirs:
+            return None
+        dirs.sort(key=lambda p: int(os.path.basename(p).split('_')[1]))
+        return dirs[-1]

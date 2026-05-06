@@ -40,7 +40,7 @@ from models import (
     build_discriminator_3d,
 )
 from losses import *
-from utils import summarize_performance, log_loss_to_csv
+from utils import summarize_performance, log_loss_to_csv,GANCheckpointManager
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,54 +97,94 @@ def get_teacher_forcing_rate():
 #  (Sky timelapse has one extra nesting level — adjust BASE_DIR if switching.)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_video_py(path):
-    path        = path.numpy().decode("utf-8")
-    frame_paths = sorted(glob(os.path.join(path, "*.jpg")))
-    total       = len(frame_paths)
-    if total == 0:
-        raise ValueError(f"No frames found in {path}")
 
-    stride        = 1   # fixed for TaiChi
-    required_span = 1 + (SEQ_LENGHT - 1) * stride
+MAX_STRIDE = 2  # adjust to your value
+
+# ── pre-compute strided frame paths in pure Python (once) ─────────────────
+def sample_frame_paths(video_dir, seq_length, max_stride):
+    frame_paths = sorted(glob(os.path.join(video_dir, "*.jpg")))
+    total = len(frame_paths)
+    if total == 0:
+        return None
+
+    stride = np.random.randint(1, max_stride + 1)
+    required_span = 1 + (seq_length - 1) * stride
 
     if total >= required_span:
-        start   = np.random.randint(0, total - required_span + 1)
-        indices = start + np.arange(SEQ_LENGHT) * stride
+        start = np.random.randint(0, total - required_span + 1)
+        indices = start + np.arange(seq_length) * stride
     else:
-        start   = np.random.randint(0, total)
-        indices = (start + np.arange(SEQ_LENGHT) * stride) % total
+        start = np.random.randint(0, total)
+        indices = (start + np.arange(seq_length) * stride) % total
 
-    frames = []
-    for f in [frame_paths[i] for i in indices]:
-        img = tf.image.decode_jpeg(tf.io.read_file(f), channels=3)
-        img = tf.image.resize(img, FRAME_SIZE)
-        img = tf.cast(img, tf.float32) / 127.5 - 1.0
-        frames.append(img)
-    return tf.stack(frames)
+    return [frame_paths[i] for i in indices]
 
 
-def load_video_tf(path):
-    return tf.py_function(func=load_video_py, inp=[path], Tout=tf.float32)
-
-
-def build_dataset():
-    # TaiChi: flat — BASE_DIR/video_name/*.jpg
-    video_dirs = []
+# collect video dirs (same logic as before)
+def make_paths(BASE_DIR,seq):
+    #video_dir=[]
+    #for name in os.listdir(BASE_DIR):
+     #   if os.path.isdir(os.path.join(BASE_DIR, name)):
+      #      # print(name)
+       #     for name_in in os.listdir(os.path.join(BASE_DIR, name)):
+        #        if os.path.isdir(os.path.join(BASE_DIR, name, name_in)) and len(glob(os.path.join(BASE_DIR, name, name_in, "*.jpg"))) >= seq:
+                    # print(name_in)
+         #           video_dir.append(os.path.join(BASE_DIR, name, name_in))
+#    video_dir.sort()
+#    print(f"Found {len(video_dir)} video directories.")
+ #   return video_dir
+    video_dirs=[]
     for name in os.listdir(BASE_DIR):
-        sub = os.path.join(BASE_DIR, name)
-        if (os.path.isdir(sub)
-                and len(glob(os.path.join(sub, "*.jpg"))) >= SEQ_LENGHT):
-            video_dirs.append(sub)
+        if os.path.isdir(os.path.join(BASE_DIR, name)):
+            if os.path.isdir(os.path.join(BASE_DIR, name)) and len(glob(os.path.join(BASE_DIR, name, "*.jpg"))) >= 128:
+                # print(name_in)
+                video_dirs.append(os.path.join(BASE_DIR, name))
     video_dirs.sort()
     print(f"Found {len(video_dirs)} video directories.")
+   # print(f"Found {len(video_dir)} video directories.")
+    return video_dirs
 
-    ds = tf.data.Dataset.from_tensor_slices(video_dirs)
-    ds = ds.map(load_video_tf, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.cache()
-    ds = ds.batch(1)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
+def load_frame(path):
+    """Pure TF op — safe for prefetch / parallel map."""
+    img = tf.io.read_file(path)
+    img = tf.image.decode_jpeg(img, channels=3)
+    img = tf.image.resize(img, FRAME_SIZE)
+    img = tf.cast(img, tf.float32) / 127.5 - 1.0
+    return img                                      # (H, W, 3)
 
+
+def make_dataset(video_dirs, seq_length, max_stride):
+    """
+    Re-samples strides every time make_dataset() is called.
+    Call once per epoch to get fresh random strides.
+    """
+    # sample all paths in Python — O(n_videos), negligible cost
+    all_selected = []
+    for vd in video_dirs:
+        paths = sample_frame_paths(vd, seq_length, max_stride)
+        if paths is not None:
+            all_selected.append(paths)          # list of SEQ_LENGTH strings
+
+    # shape: (n_videos, SEQ_LENGTH) — from_tensor_slices gives one row per video
+    path_ds = tf.data.Dataset.from_tensor_slices(all_selected)
+
+    # map load_frame over each row (SEQ_LENGTH paths) → (SEQ_LENGTH, H, W, C)
+    video_ds = path_ds.map(
+        lambda paths: tf.map_fn(
+            load_frame,
+            paths,
+            fn_output_signature=tf.TensorSpec(shape=[FRAME_SIZE[0], FRAME_SIZE[1], 3],
+                                          dtype=tf.float32)
+        ),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+
+    return (video_ds
+            .shuffle(max(BATCH_SIZE * 4, 64))
+            .batch(BATCH_SIZE, drop_remainder=True)
+            .prefetch(tf.data.AUTOTUNE))
+
+  
 #  ──────────────────────────────────────────────────────────────────────────────
 #  OPTIMIZERS
 #  Note: plain Adam (no LossScaleOptimizer) because discriminator is float32
@@ -276,7 +316,11 @@ def train_gan(generator, discriminator, dataset, epochs=1000):
     profile_stop  = args.profile_warmup + args.profile_steps
 
     for epoch in range(epochs):
-        for step, batch in enumerate(dataset):
+        video_dirs = make_paths(BASE_DIR, SEQ_LENGHT)
+        video_dataset    = make_dataset(video_dirs, SEQ_LENGHT, 1)
+        for video in video_dataset.take(1):
+            print(f"[DEBUG] sample video shape={video.shape}", flush=True)
+        for step, batch in enumerate(video_dataset):
             X_train = batch[0]
 
             if args.profile and global_step == profile_start:
@@ -351,10 +395,34 @@ if __name__ == '__main__':
         vid_shape=(minibatch[1], FRAME_SIZE[0], FRAME_SIZE[1], 3)
     )
     discriminator.summary()
-
+    ckpt_manager = GANCheckpointManager(
+        folder         = folder,
+        generator      = generator,
+        discriminator  = discriminator,
+        discriminator2 = None,
+        gen_opt        = generator_optimizer,
+        disc_opt       = discriminator_optimizer,
+        disc2_opt      = None,
+        n_frames       = SEQ_LENGHT,
+        # build_disc_fn  = lambda: build_stylegan_v_discriminator(
+        #                      frame_size=FRAME_SIZE, k_frames=K_FRAMES),
+        build_disc_fn=lambda: build_discriminator_3d(
+        vid_shape=(minibatch[1], FRAME_SIZE[0], FRAME_SIZE[1], 3)),
+        build_disc2_fn = None,
+        save_every     = 5000,
+        keep_last      = 3,
+    )
+    start_z, start_epoch,restored_generator,restored_disc = ckpt_manager.restore_if_available()
+    if restored_generator is not None:
+        generator=restored_generator
+    if restored_disc is not None:
+        discriminator=restored_disc
+ 
     # -- dataset & train -----------------------------------------------------
-    video_dataset = build_dataset()
-
+    video_dirs = make_paths(BASE_DIR, SEQ_LENGHT)
+    video_dataset    = make_dataset(video_dirs, SEQ_LENGHT, 1)
+    for video in video_dataset.take(1):
+        print(f"[DEBUG] sample video shape={video.shape}", flush=True)
     # Quick shape check
     for v in video_dataset.take(1):
         print("Sample video shape:", v.shape)
