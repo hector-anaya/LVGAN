@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.h5
+*.egg-info/
+exp_*/
+*.csv
+*.png
+*.log
+*.txt

@@ -1,0 +1,362 @@
+#!/usr/bin/env python
+# coding: utf-8
+"""
+train.py
+========
+Entry point for exp_test_claude_taichi.
+
+  - Dataset loading (TaiChi flat structure: BASE_DIR/video_name/*.jpg)
+  - Teacher-forcing schedule
+  - train_step (tf.while_loop for disc updates, @tf.function)
+  - train_step_multi (@tf.function)
+  - train_gan (main loop)
+"""
+
+import argparse
+import os
+
+parser = argparse.ArgumentParser(description='Train .')
+parser.add_argument('--folder', type=str, default='exp_new_test', help='Folder to save logs and models')
+parser.add_argument('--gpu', type=str, default='0', help='GPU device to use (e.g., "0", "1", "0,1")')
+parser.add_argument('--islocal', type=bool, default=0, help='Flag to indicate local execution (for debugging)')
+parser.add_argument('--profile', action='store_true', help='Profile a short window of steps to <folder>/profile/ and exit')
+parser.add_argument('--profile_warmup', type=int, default=5, help='Steps to warm up before profiler starts')
+parser.add_argument('--profile_steps', type=int, default=10, help='Number of steps to capture in the profile')
+args = parser.parse_args()
+
+os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+
+import numpy as np
+import tensorflow as tf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from glob import glob
+
+# -- local modules ----------------------------------------------------------
+from models import (
+    define_generator,
+    CreateARLTCGAN,
+    build_discriminator_3d,
+)
+from losses import *
+from utils import summarize_performance, log_loss_to_csv
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  CONFIGURATION
+# ──────────────────────────────────────────────────────────────────────────────
+
+folder     = args.folder.rstrip('/') + '/'
+SEQ_LENGHT = 128
+FRAME_SIZE = (256, 256)
+minibatch  = (8, 16)
+MAX_STRIDE = 1   # stride fixed to 1 for TaiChi
+
+# TaiChi dataset has a flat structure: BASE_DIR/video_name/*.jpg
+# BASE_DIR   = '/home/hector.anaya/Datasets/sky_timelapse/sky_train'
+
+
+if args.islocal:
+    BASE_DIR='/mnt/d/PHD/Experiments/Dataset/UCFCLASS/TaiChi'
+else:
+    BASE_DIR='/home/hector.anaya/Datasets/TaiChi'
+# Teacher-forcing schedule
+TF_RATE_INIT   = 1.0
+TF_MIN         = 0.1
+TF_DECAY_STEPS = 100_000
+tf_step_counter = tf.Variable(0, trainable=False, dtype=tf.float32)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  LOSS WEIGHTS
+# ──────────────────────────────────────────────────────────────────────────────
+LAMBDA = 1
+TEMP   = 0.01
+GRAD   = 10
+FRAME  = 10000
+PERC   = 1000
+PEN    = 10
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  LR SCHEDULE
+# ──────────────────────────────────────────────────────────────────────────────
+TOTAL_STEPS  = 300_000
+WARMUP_STEPS = 2_000
+
+
+def get_teacher_forcing_rate():
+    """Linear decay from TF_RATE_INIT → TF_MIN over TF_DECAY_STEPS."""
+    progress = tf.minimum(tf_step_counter / TF_DECAY_STEPS, 1.0)
+    return TF_RATE_INIT - progress * (TF_RATE_INIT - TF_MIN)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  DATASET
+#  TaiChi is a flat structure: each sub-folder directly contains *.jpg frames.
+#  (Sky timelapse has one extra nesting level — adjust BASE_DIR if switching.)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_video_py(path):
+    path        = path.numpy().decode("utf-8")
+    frame_paths = sorted(glob(os.path.join(path, "*.jpg")))
+    total       = len(frame_paths)
+    if total == 0:
+        raise ValueError(f"No frames found in {path}")
+
+    stride        = 1   # fixed for TaiChi
+    required_span = 1 + (SEQ_LENGHT - 1) * stride
+
+    if total >= required_span:
+        start   = np.random.randint(0, total - required_span + 1)
+        indices = start + np.arange(SEQ_LENGHT) * stride
+    else:
+        start   = np.random.randint(0, total)
+        indices = (start + np.arange(SEQ_LENGHT) * stride) % total
+
+    frames = []
+    for f in [frame_paths[i] for i in indices]:
+        img = tf.image.decode_jpeg(tf.io.read_file(f), channels=3)
+        img = tf.image.resize(img, FRAME_SIZE)
+        img = tf.cast(img, tf.float32) / 127.5 - 1.0
+        frames.append(img)
+    return tf.stack(frames)
+
+
+def load_video_tf(path):
+    return tf.py_function(func=load_video_py, inp=[path], Tout=tf.float32)
+
+
+def build_dataset():
+    # TaiChi: flat — BASE_DIR/video_name/*.jpg
+    video_dirs = []
+    for name in os.listdir(BASE_DIR):
+        sub = os.path.join(BASE_DIR, name)
+        if (os.path.isdir(sub)
+                and len(glob(os.path.join(sub, "*.jpg"))) >= SEQ_LENGHT):
+            video_dirs.append(sub)
+    video_dirs.sort()
+    print(f"Found {len(video_dirs)} video directories.")
+
+    ds = tf.data.Dataset.from_tensor_slices(video_dirs)
+    ds = ds.map(load_video_tf, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.cache()
+    ds = ds.batch(1)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
+
+#  ──────────────────────────────────────────────────────────────────────────────
+#  OPTIMIZERS
+#  Note: plain Adam (no LossScaleOptimizer) because discriminator is float32
+# ──────────────────────────────────────────────────────────────────────────────
+
+generator_optimizer = tf.keras.optimizers.Adam(
+    WarmupCosineDecay(0.0002, WARMUP_STEPS, TOTAL_STEPS),
+    beta_1=0.0, beta_2=0.999,
+)
+discriminator_optimizer = tf.keras.optimizers.Adam(
+    WarmupCosineDecay(0.0001, WARMUP_STEPS, TOTAL_STEPS),
+    beta_1=0.0, beta_2=0.999,
+)
+
+
+def generator_loss(disc_generated_output, gen_output, target,
+                   minibatch_size=16):
+    gan_loss   = -tf.reduce_mean(disc_generated_output)       # WGAN
+    l1_loss    = tf.reduce_mean(tf.abs(target - gen_output))
+    temp       = temporal_consistency_loss(gen_output, target)
+    grad_temp  = gradient_temporal_loss(gen_output, target)
+    frame_loss = frame_difference_loss(gen_output, target)
+    perp       = perceptual_loss(gen_output, target, minibatch_size)
+
+    total = (
+        gan_loss
+        + LAMBDA * l1_loss
+        + PERC   * perp
+        + TEMP   * temp
+        + GRAD   * grad_temp
+        + FRAME  * frame_loss
+    )
+    return total, gan_loss, l1_loss, temp, perp, grad_temp, frame_loss
+
+# 
+# ──────────────────────────────────────────────────────────────────────────────
+#  TRAIN STEPS
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tf.function
+def train_step(target, generator, discriminator):
+    tf_rate = get_teacher_forcing_rate()
+
+    # ── 3× discriminator updates via tf.while_loop ───────────────────────────
+    def _disc_cond(i, penalty, disc_loss):
+        return i < 3
+
+    def _disc_body(i, penalty, disc_loss):
+        with tf.GradientTape() as disc_tape:
+            gen_output            = generator(
+                n=minibatch[1], og_frames=target[0],
+                noise=tf.random.uniform((1, 400)),
+            )
+            disc_real_output      = discriminator(target,     training=True)
+            disc_generated_output = discriminator(gen_output, training=True)
+            penalty               = gradient_penalty(
+                discriminator, target, gen_output
+            )
+            disc_loss = (discriminator_loss(disc_real_output,
+                                            disc_generated_output)
+                         + penalty * PEN)
+
+        disc_grads = disc_tape.gradient(
+            disc_loss, discriminator.trainable_variables
+        )
+        discriminator_optimizer.apply_gradients(
+            zip(disc_grads, discriminator.trainable_variables)
+        )
+        return i + 1, penalty, disc_loss
+
+    _, penalty, disc_loss = tf.while_loop(
+        _disc_cond, _disc_body,
+        loop_vars=[tf.constant(0), tf.constant(0.0), tf.constant(0.0)],
+        parallel_iterations=1,
+    )
+
+    # ── 1× generator update ──────────────────────────────────────────────────
+    with tf.GradientTape() as gen_tape:
+        gen_output = generator(
+            n=minibatch[1], og_frames=target[0],
+            teacher_forcing_rate=tf_rate,
+            noise=tf.random.uniform((1, 400)),
+            training=True,
+        )
+        disc_generated_output = discriminator(gen_output)
+        (gen_total_loss, gen_gan_loss, gen_l1_loss,
+         temp, perp, grad, fram) = generator_loss(
+            disc_generated_output, gen_output, target,
+            minibatch_size=minibatch[1],
+        )
+
+    gen_grads = gen_tape.gradient(
+        gen_total_loss, generator.trainable_variables
+    )
+    generator_optimizer.apply_gradients(
+        zip(gen_grads, generator.trainable_variables)
+    )
+
+    tf_step_counter.assign_add(1.0)
+    return (gen_total_loss, gen_gan_loss, gen_l1_loss,
+            disc_loss, penalty, temp, perp, grad, fram)
+
+
+@tf.function
+def train_step_multi(target, generator, discriminator):
+    """Average losses over minibatch[0] mini-clip steps."""
+    k  = tf.constant(0, dtype=tf.int32)
+    aa = tf.zeros(9)
+    for _ in tf.range(minibatch[0]):
+        X_mini = target[k : minibatch[1] + k]
+        k      = k + minibatch[1] - 1
+        aa     = aa + train_step(
+            tf.expand_dims(X_mini, axis=0), generator, discriminator
+        )
+    return aa / tf.cast(minibatch[0], tf.float32)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  MAIN TRAINING LOOP
+# ──────────────────────────────────────────────────────────────────────────────
+
+def train_gan(generator, discriminator, dataset, epochs=1000):
+    os.makedirs(folder, exist_ok=True)
+    global_step = 0
+    best_loss   = np.inf
+
+    profile_dir   = os.path.join(folder, 'profile')
+    profile_start = args.profile_warmup
+    profile_stop  = args.profile_warmup + args.profile_steps
+
+    for epoch in range(epochs):
+        for step, batch in enumerate(dataset):
+            X_train = batch[0]
+
+            if args.profile and global_step == profile_start:
+                tf.profiler.experimental.start(profile_dir)
+                print(f"[profiler] started — capturing {args.profile_steps} steps to {profile_dir}")
+
+            with tf.profiler.experimental.Trace('train', step_num=global_step, _r=1):
+                a, b, c, d, e, f, g, h, i = train_step_multi(
+                    X_train, generator, discriminator
+                )
+
+            if args.profile and global_step == profile_stop - 1:
+                tf.profiler.experimental.stop()
+                print(f"[profiler] stopped — view with: tensorboard --logdir {profile_dir}")
+                return
+
+            log_loss_to_csv(
+                epoch, global_step, a, b, c, d, e, f, g, h, i,
+                csv_filename=os.path.join(folder, 'log.csv'),
+            )
+
+            if global_step % 1000 == 0:
+                tf_rate_val = get_teacher_forcing_rate()
+                print(
+                    f"[Epoch {epoch:04d} | Step {step:05d} | GS {global_step:06d}]"
+                    f"  gen={float(a):.4f}  gan={float(b):.4f}"
+                    f"  l1={float(c):.4f}  disc={float(d):.4f}"
+                    f"  gp={float(e):.4f}  temp={float(f):.4f}"
+                    f"  perc={float(h):.4f}  frame={float(i):.4f}"
+                    f"  TF={float(tf_rate_val):.3f}"
+                )
+                summarize_performance(
+                    global_step, X_train, generator, discriminator,
+                    folder, n_samples=minibatch[1] // 2, g_loss=float(a),
+                )
+
+            if float(i) * FRAME < best_loss:
+                best_loss = float(i) * FRAME
+                generator.save_weights(
+                    os.path.join(folder, 'best_generator.h5')
+                )
+                print(
+                    f"  ↳ New best saved"
+                    f" (frame_loss={float(i):.4f})"
+                )
+
+            global_step += 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ENTRY POINT
+# ──────────────────────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    os.makedirs(folder, exist_ok=True)
+    os.system(f'cp train.py {folder}/')
+    os.system(f'cp models.py {folder}/')
+    os.system(f'cp losses.py {folder}/')
+    os.system(f'cp utils.py {folder}/')
+
+    # -- build models --------------------------------------------------------
+    generator_base = define_generator(
+        z_shape=(400,),
+        image_shape=(FRAME_SIZE[0], FRAME_SIZE[1], 3),
+    )
+    generator_base.summary()
+
+    generator     = CreateARLTCGAN(generator_base,
+                                   dim_z_motion=200,
+                                   dim_z_content=200)
+    discriminator = build_discriminator_3d(
+        vid_shape=(minibatch[1], FRAME_SIZE[0], FRAME_SIZE[1], 3)
+    )
+    discriminator.summary()
+
+    # -- dataset & train -----------------------------------------------------
+    video_dataset = build_dataset()
+
+    # Quick shape check
+    for v in video_dataset.take(1):
+        print("Sample video shape:", v.shape)
+
+    train_gan(generator, discriminator, video_dataset, epochs=1000)
