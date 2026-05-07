@@ -255,33 +255,35 @@ def train_step(target, generator, discriminator):
         )
         return i + 1, penalty, disc_loss
 
-    _, penalty, disc_loss = tf.while_loop(
-        _disc_cond, _disc_body,
-        loop_vars=[tf.constant(0), tf.constant(0.0), tf.constant(0.0)],
-        parallel_iterations=1,
-    )
+    with tf.profiler.experimental.Trace('disc_3x'):
+        _, penalty, disc_loss = tf.while_loop(
+            _disc_cond, _disc_body,
+            loop_vars=[tf.constant(0), tf.constant(0.0), tf.constant(0.0)],
+            parallel_iterations=1,
+        )
 
     # ── 1× generator update ──────────────────────────────────────────────────
-    with tf.GradientTape() as gen_tape:
-        gen_output = generator(
-            n=minibatch[1], og_frames=target[0],
-            teacher_forcing_rate=tf_rate,
-            noise=tf.random.uniform((1, 400)),
-            training=True,
-        )
-        disc_generated_output = discriminator(gen_output)
-        (gen_total_loss, gen_gan_loss, gen_l1_loss,
-         temp, perp, grad, fram) = generator_loss(
-            disc_generated_output, gen_output, target,
-            minibatch_size=minibatch[1],
-        )
+    with tf.profiler.experimental.Trace('gen_update'):
+        with tf.GradientTape() as gen_tape:
+            gen_output = generator(
+                n=minibatch[1], og_frames=target[0],
+                teacher_forcing_rate=tf_rate,
+                noise=tf.random.uniform((1, 400)),
+                training=True,
+            )
+            disc_generated_output = discriminator(gen_output)
+            (gen_total_loss, gen_gan_loss, gen_l1_loss,
+             temp, perp, grad, fram) = generator_loss(
+                disc_generated_output, gen_output, target,
+                minibatch_size=minibatch[1],
+            )
 
-    gen_grads = gen_tape.gradient(
-        gen_total_loss, generator.trainable_variables
-    )
-    generator_optimizer.apply_gradients(
-        zip(gen_grads, generator.trainable_variables)
-    )
+        gen_grads = gen_tape.gradient(
+            gen_total_loss, generator.trainable_variables
+        )
+        generator_optimizer.apply_gradients(
+            zip(gen_grads, generator.trainable_variables)
+        )
 
     tf_step_counter.assign_add(1.0)
     return (gen_total_loss, gen_gan_loss, gen_l1_loss,
@@ -290,15 +292,20 @@ def train_step(target, generator, discriminator):
 
 @tf.function
 def train_step_multi(target, generator, discriminator):
-    """Average losses over minibatch[0] mini-clip steps."""
-    k  = tf.constant(0, dtype=tf.int32)
+    """Average losses over minibatch[0] mini-clip steps.
+
+    Loop is Python-unrolled (not tf.range) so each iteration emits its own
+    profiler Trace region — tf.range would convert to tf.while_loop and the
+    Trace would fire only once at trace time.
+    """
     aa = tf.zeros(9)
-    for _ in tf.range(minibatch[0]):
+    for j in range(minibatch[0]):
+        k      = j * (minibatch[1] - 1)
         X_mini = target[k : minibatch[1] + k]
-        k      = k + minibatch[1] - 1
-        aa     = aa + train_step(
-            tf.expand_dims(X_mini, axis=0), generator, discriminator
-        )
+        with tf.profiler.experimental.Trace('mini_clip', step_num=j):
+            aa = aa + train_step(
+                tf.expand_dims(X_mini, axis=0), generator, discriminator
+            )
     return aa / tf.cast(minibatch[0], tf.float32)
 
 
