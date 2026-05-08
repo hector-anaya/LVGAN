@@ -136,7 +136,7 @@ def make_paths(BASE_DIR,seq):
     video_dirs=[]
     for name in os.listdir(BASE_DIR):
         if os.path.isdir(os.path.join(BASE_DIR, name)):
-            if os.path.isdir(os.path.join(BASE_DIR, name)) and len(glob(os.path.join(BASE_DIR, name, "*.jpg"))) >= 128:
+            if os.path.isdir(os.path.join(BASE_DIR, name)) and len(glob(os.path.join(BASE_DIR, name, "*.jpg"))) >= SEQ_LENGHT:
                 # print(name_in)
                 video_dirs.append(os.path.join(BASE_DIR, name))
     video_dirs.sort()
@@ -180,8 +180,7 @@ def make_dataset(video_dirs, seq_length, max_stride):
     )
 
     return (video_ds
-            .shuffle(max(BATCH_SIZE * 4, 64))
-            .batch(BATCH_SIZE, drop_remainder=True)
+            .batch(1)
             .prefetch(tf.data.AUTOTUNE))
 
   
