@@ -65,6 +65,9 @@ else:
 TF_RATE_INIT   = 1.0
 TF_MIN         = 0.1
 TF_DECAY_STEPS = 100_000
+# Step number for profiler step markers — assigned each iteration in train_gan
+# so the @tf.function sees a fresh value without retracing.
+_profile_step_var = tf.Variable(0, trainable=False, dtype=tf.int64)
 tf_step_counter = tf.Variable(0, trainable=False, dtype=tf.float32)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -285,6 +288,7 @@ def train_step(target, generator, discriminator):
         )
 
     tf_step_counter.assign_add(1.0)
+
     return (gen_total_loss, gen_gan_loss, gen_l1_loss,
             disc_loss, penalty, temp, perp, grad, fram)
 
@@ -292,20 +296,22 @@ def train_step(target, generator, discriminator):
 @tf.function
 def train_step_multi(target, generator, discriminator):
     """Average losses over minibatch[0] mini-clip steps.
-
-    Loop is Python-unrolled (not tf.range) so each iteration emits its own
-    profiler Trace region — tf.range would convert to tf.while_loop and the
-    Trace would fire only once at trace time.
+    Outer Trace is INSIDE the @tf.function so the step marker is captured on
+    the device timeline (host-side wrapping in eager mode ends before async
+    GPU work finishes, which is why TB's Overview page sees "no step marker").
+    Inner mini-clip loop is Python-unrolled so each iteration emits its own
+    Trace region.
     """
-    aa = tf.zeros(9)
-    for j in range(minibatch[0]):
-        k      = j * (minibatch[1] - 1)
-        X_mini = target[k : minibatch[1] + k]
-        with tf.profiler.experimental.Trace('mini_clip', step_num=j):
-            aa = aa + train_step(
-                tf.expand_dims(X_mini, axis=0), generator, discriminator
-            )
-    return aa / tf.cast(minibatch[0], tf.float32)
+    with tf.profiler.experimental.Trace('train_step', step_num=_profile_step_var):
+        aa = tf.zeros(9)
+        for j in range(minibatch[0]):
+            k      = j * (minibatch[1] - 1)
+            X_mini = target[k : minibatch[1] + k]
+            with tf.profiler.experimental.Trace('mini_clip', step_num=j):
+                aa = aa + train_step(
+                    tf.expand_dims(X_mini, axis=0), generator, discriminator
+                )
+        return aa / tf.cast(minibatch[0], tf.float32)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -332,9 +338,8 @@ def train_gan(generator, discriminator, dataset, epochs=1000):
             if args.profile and global_step == profile_start:
                 tf.profiler.experimental.start(profile_dir)
                 print(f"[profiler] started — capturing {args.profile_steps} steps to {profile_dir}")
-
-            with tf.profiler.experimental.Trace('train', step_num=global_step, _r=1):
-                a, b, c, d, e, f, g, h, i = train_step_multi(
+            _profile_step_var.assign(global_step)
+            a, b, c, d, e, f, g, h, i = train_step_multi(
                     X_train, generator, discriminator
                 )
 
