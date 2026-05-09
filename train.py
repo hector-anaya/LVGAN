@@ -80,11 +80,9 @@ FRAME  = 10000
 PERC   = 1000
 
 # ── R1 regularization (replaces WGAN-GP gradient penalty) ────────────────────
-# Lazy regularization a la StyleGAN2: compute R1 every R1_INTERVAL disc steps,
-# scale by R1_INTERVAL so expected contribution is unchanged.
-R1_GAMMA    = 1.0
-R1_INTERVAL = 16
-r1_counter  = tf.Variable(0, trainable=False, dtype=tf.int64)
+# Computed every disc step (lazy R1 via tf.cond was attempted but the nested
+# 2nd-order tape returns None in graph mode — see train_step for details).
+R1_GAMMA = 1.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -243,46 +241,32 @@ def train_step(target, generator, discriminator):
         noise=tf.random.uniform((1, 400)),
     ))
 
-    # ── 1× discriminator update with lazy R1 (StyleGAN2-style) ───────────────
-    # R1 runs every R1_INTERVAL steps; on those steps the contribution is
-    # multiplied by R1_INTERVAL so the time-averaged effect is unchanged.
-    do_r1 = tf.equal(r1_counter % tf.cast(R1_INTERVAL, tf.int64), 0)
-
-    def _disc_with_r1():
+    # ── 1× discriminator update with R1 regularization ───────────────────────
+    # NOTE: lazy R1 (compute every K steps) was attempted via tf.cond but the
+    # nested GradientTape inside a cond branch returns None for grad_x — a
+    # known sharp edge with Keras Models + 2nd-order grads in graph mode.
+    # Computing R1 every step is simpler and still much cheaper than the old
+    # 3x WGAN-GP path (one extra disc forward + one input-grad vs three full
+    # disc updates with GP). Lazy regularization can be reintroduced later if
+    # profiler shows R1 as a bottleneck.
+    with tf.profiler.experimental.Trace('disc_update'):
         with tf.GradientTape() as disc_tape:
             with tf.GradientTape() as r1_tape:
                 r1_tape.watch(target)
                 d_real = discriminator(target, training=True)
             grad_x = r1_tape.gradient(tf.reduce_sum(d_real), target)
-            r1_val = 0.5 * tf.reduce_mean(
+            r1 = 0.5 * tf.reduce_mean(
                 tf.reduce_sum(tf.square(grad_x), axis=[1, 2, 3, 4])
             )
 
-            d_fake     = discriminator(fake_for_disc, training=True)
-            d_logistic = discriminator_loss(d_real, d_fake)
-            d_total    = d_logistic + R1_GAMMA * R1_INTERVAL * r1_val
+            d_fake    = discriminator(fake_for_disc, training=True)
+            disc_loss = discriminator_loss(d_real, d_fake)
+            d_total   = disc_loss + R1_GAMMA * r1
 
         d_grads = disc_tape.gradient(d_total, discriminator.trainable_variables)
         discriminator_optimizer.apply_gradients(
             zip(d_grads, discriminator.trainable_variables)
         )
-        return d_logistic, r1_val
-
-    def _disc_no_r1():
-        with tf.GradientTape() as disc_tape:
-            d_real     = discriminator(target,        training=True)
-            d_fake     = discriminator(fake_for_disc, training=True)
-            d_logistic = discriminator_loss(d_real, d_fake)
-
-        d_grads = disc_tape.gradient(d_logistic, discriminator.trainable_variables)
-        discriminator_optimizer.apply_gradients(
-            zip(d_grads, discriminator.trainable_variables)
-        )
-        return d_logistic, tf.constant(0.0)
-
-    with tf.profiler.experimental.Trace('disc_update'):
-        disc_loss, r1 = tf.cond(do_r1, _disc_with_r1, _disc_no_r1)
-        r1_counter.assign_add(1)
 
     # ── 1× generator update ──────────────────────────────────────────────────
     with tf.profiler.experimental.Trace('gen_update'):
