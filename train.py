@@ -60,7 +60,7 @@ MAX_STRIDE = 1   # stride fixed to 1 for TaiChi
 if args.islocal:
     BASE_DIR='/mnt/d/PHD/Experiments/Dataset/UCFCLASS/TaiChi'
 else:
-    BASE_DIR='/home/hector.anaya1/Datasets/UCF101processed'
+    BASE_DIR='/usuarios03/hector.anaya1/Datasets/UCF101processed'
 # Teacher-forcing schedule
 TF_RATE_INIT   = 1.0
 TF_MIN         = 0.1
