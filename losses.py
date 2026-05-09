@@ -12,8 +12,9 @@ All loss functions, optimizers, and LR schedules for exp_test_claude_taichi.
   - gradient_temporal_loss     (second-order finite differences)
   - frame_difference_loss
   - generator_loss
-  - discriminator_loss
-  - gradient_penalty           (WGAN-GP, discriminator passed explicitly)
+  - discriminator_loss          (non-saturating logistic — softplus form)
+  - generator_gan_loss          (non-saturating logistic)
+  - r1_penalty                  (R1 regularization helper — see train_step for inline use)
 """
 
 import tensorflow as tf
@@ -140,24 +141,31 @@ def frame_difference_loss(gen, gt):
 
 
 def discriminator_loss(disc_real_output, disc_generated_output):
-    return (-tf.reduce_mean(disc_real_output)
-            + tf.reduce_mean(disc_generated_output))
+    """Non-saturating logistic discriminator loss (StyleGAN-style).
 
-
-def gradient_penalty(discriminator, x, x_gen):
+    softplus(-D(real)) + softplus(D(fake))
+    is the numerically-stable form of -log(sigmoid(D_real)) - log(1 - sigmoid(D_fake)).
+    Discriminator output should be raw logits (no sigmoid).
     """
-    WGAN-GP gradient penalty.
-    discriminator is passed explicitly so this function has no global deps.
+    return (tf.reduce_mean(tf.nn.softplus(-disc_real_output))
+            + tf.reduce_mean(tf.nn.softplus(disc_generated_output)))
+
+
+def generator_gan_loss(disc_generated_output):
+    """Non-saturating logistic generator loss: softplus(-D(fake)).
+
+    Equivalent to -log(sigmoid(D(fake))). Used by generator_loss in train.py.
     """
-    x     = tf.cast(x,     tf.float32)
-    x_gen = tf.cast(x_gen, tf.float32)
-    eps   = tf.random.uniform([tf.shape(x)[0], 1, 1, 1, 1], 0.0, 1.0)
-    x_hat = x + eps * (x_gen - x)
+    return tf.reduce_mean(tf.nn.softplus(-disc_generated_output))
 
-    with tf.GradientTape() as t:
-        t.watch(x_hat)
-        d_hat = discriminator(x_hat, training=True)
 
-    grads = t.gradient(d_hat, x_hat)
-    ddx   = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3, 4]))
-    return tf.reduce_mean((ddx - 1.0) ** 2)
+def r1_penalty(disc_real_output, real_input):
+    """R1 regularization (Mescheder et al. 2018).
+
+    Computes 0.5 * E[ || grad_x D(x_real) ||^2 ].
+    Caller must pass `disc_real_output` produced under an outer GradientTape
+    that watches `real_input` — see train_step in train.py.
+    """
+    grads = tf.gradients(tf.reduce_sum(disc_real_output), real_input)[0]
+    grad_sq = tf.reduce_sum(tf.square(grads), axis=[1, 2, 3, 4])
+    return 0.5 * tf.reduce_mean(grad_sq)

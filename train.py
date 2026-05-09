@@ -78,7 +78,13 @@ TEMP   = 0.01
 GRAD   = 10
 FRAME  = 10000
 PERC   = 1000
-PEN    = 10
+
+# ── R1 regularization (replaces WGAN-GP gradient penalty) ────────────────────
+# Lazy regularization a la StyleGAN2: compute R1 every R1_INTERVAL disc steps,
+# scale by R1_INTERVAL so expected contribution is unchanged.
+R1_GAMMA    = 1.0
+R1_INTERVAL = 16
+r1_counter  = tf.Variable(0, trainable=False, dtype=tf.int64)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -204,7 +210,7 @@ discriminator_optimizer = tf.keras.optimizers.Adam(
 
 def generator_loss(disc_generated_output, gen_output, target,
                    minibatch_size=16):
-    gan_loss   = -tf.reduce_mean(disc_generated_output)       # WGAN
+    gan_loss   = generator_gan_loss(disc_generated_output)    # non-saturating logistic
     l1_loss    = tf.reduce_mean(tf.abs(target - gen_output))
     temp       = temporal_consistency_loss(gen_output, target)
     grad_temp  = gradient_temporal_loss(gen_output, target)
@@ -230,39 +236,53 @@ def generator_loss(disc_generated_output, gen_output, target,
 def train_step(target, generator, discriminator):
     tf_rate = get_teacher_forcing_rate()
 
-    # ── 3× discriminator updates via tf.while_loop ───────────────────────────
-    def _disc_cond(i, penalty, disc_loss):
-        return i < 3
+    # ── Generate fakes once for the disc update (no gradient into generator) ─
+    # Cuts the AR generator from 4 calls/step (3 disc + 1 gen) down to 2.
+    fake_for_disc = tf.stop_gradient(generator(
+        n=minibatch[1], og_frames=target[0],
+        noise=tf.random.uniform((1, 400)),
+    ))
 
-    def _disc_body(i, penalty, disc_loss):
+    # ── 1× discriminator update with lazy R1 (StyleGAN2-style) ───────────────
+    # R1 runs every R1_INTERVAL steps; on those steps the contribution is
+    # multiplied by R1_INTERVAL so the time-averaged effect is unchanged.
+    do_r1 = tf.equal(r1_counter % tf.cast(R1_INTERVAL, tf.int64), 0)
+
+    def _disc_with_r1():
         with tf.GradientTape() as disc_tape:
-            gen_output            = generator(
-                n=minibatch[1], og_frames=target[0],
-                noise=tf.random.uniform((1, 400)),
+            with tf.GradientTape() as r1_tape:
+                r1_tape.watch(target)
+                d_real = discriminator(target, training=True)
+            grad_x = r1_tape.gradient(tf.reduce_sum(d_real), target)
+            r1_val = 0.5 * tf.reduce_mean(
+                tf.reduce_sum(tf.square(grad_x), axis=[1, 2, 3, 4])
             )
-            disc_real_output      = discriminator(target,     training=True)
-            disc_generated_output = discriminator(gen_output, training=True)
-            penalty               = gradient_penalty(
-                discriminator, target, gen_output
-            )
-            disc_loss = (discriminator_loss(disc_real_output,
-                                            disc_generated_output)
-                         + penalty * PEN)
 
-        disc_grads = disc_tape.gradient(
-            disc_loss, discriminator.trainable_variables
-        )
+            d_fake     = discriminator(fake_for_disc, training=True)
+            d_logistic = discriminator_loss(d_real, d_fake)
+            d_total    = d_logistic + R1_GAMMA * R1_INTERVAL * r1_val
+
+        d_grads = disc_tape.gradient(d_total, discriminator.trainable_variables)
         discriminator_optimizer.apply_gradients(
-            zip(disc_grads, discriminator.trainable_variables)
+            zip(d_grads, discriminator.trainable_variables)
         )
-        return i + 1, penalty, disc_loss
+        return d_logistic, r1_val
 
-    with tf.profiler.experimental.Trace('disc_3x'):
-        _, penalty, disc_loss = tf.while_loop(
-            _disc_cond, _disc_body,
-            loop_vars=[tf.constant(0), tf.constant(0.0), tf.constant(0.0)],
-            parallel_iterations=1,
+    def _disc_no_r1():
+        with tf.GradientTape() as disc_tape:
+            d_real     = discriminator(target,        training=True)
+            d_fake     = discriminator(fake_for_disc, training=True)
+            d_logistic = discriminator_loss(d_real, d_fake)
+
+        d_grads = disc_tape.gradient(d_logistic, discriminator.trainable_variables)
+        discriminator_optimizer.apply_gradients(
+            zip(d_grads, discriminator.trainable_variables)
         )
+        return d_logistic, tf.constant(0.0)
+
+    with tf.profiler.experimental.Trace('disc_update'):
+        disc_loss, r1 = tf.cond(do_r1, _disc_with_r1, _disc_no_r1)
+        r1_counter.assign_add(1)
 
     # ── 1× generator update ──────────────────────────────────────────────────
     with tf.profiler.experimental.Trace('gen_update'):
@@ -290,7 +310,7 @@ def train_step(target, generator, discriminator):
     tf_step_counter.assign_add(1.0)
 
     return (gen_total_loss, gen_gan_loss, gen_l1_loss,
-            disc_loss, penalty, temp, perp, grad, fram)
+            disc_loss, r1, temp, perp, grad, fram)
 
 
 @tf.function
@@ -359,7 +379,7 @@ def train_gan(generator, discriminator, dataset, epochs=1000):
                     f"[Epoch {epoch:04d} | Step {step:05d} | GS {global_step:06d}]"
                     f"  gen={float(a):.4f}  gan={float(b):.4f}"
                     f"  l1={float(c):.4f}  disc={float(d):.4f}"
-                    f"  gp={float(e):.4f}  temp={float(f):.4f}"
+                    f"  r1={float(e):.4f}  temp={float(f):.4f}"
                     f"  perc={float(h):.4f}  frame={float(i):.4f}"
                     f"  TF={float(tf_rate_val):.3f}"
                 )
