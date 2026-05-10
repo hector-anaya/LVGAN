@@ -242,21 +242,18 @@ def train_step(target, generator, discriminator):
     ))
 
     # ── 1× discriminator update with R1 regularization ───────────────────────
-    # NOTE: lazy R1 (compute every K steps) was attempted via tf.cond but the
-    # nested GradientTape inside a cond branch returns None for grad_x — a
-    # known sharp edge with Keras Models + 2nd-order grads in graph mode.
-    # Computing R1 every step is simpler and still much cheaper than the old
-    # 3x WGAN-GP path (one extra disc forward + one input-grad vs three full
-    # disc updates with GP). Lazy regularization can be reintroduced later if
-    # profiler shows R1 as a bottleneck.
+    # Uses tf.gradients (graph-mode native) for the input gradient instead of
+    # a nested GradientTape — the tape's watch() of a function-arg tensor does
+    # not always connect through Keras Model __call__, returning None. This is
+    # the same pattern used in Nvidia's reference StyleGAN2 TF implementation.
+    # The outer disc_tape still records tf.gradients' output and computes the
+    # second-order gradient wrt disc params correctly.
     with tf.profiler.experimental.Trace('disc_update'):
         with tf.GradientTape() as disc_tape:
-            with tf.GradientTape() as r1_tape:
-                r1_tape.watch(target)
-                d_real = discriminator(target, training=True)
-            grad_x = r1_tape.gradient(tf.reduce_sum(d_real), target)
+            d_real      = discriminator(target, training=True)
+            real_grads  = tf.gradients(tf.reduce_sum(d_real), target)[0]
             r1 = 0.5 * tf.reduce_mean(
-                tf.reduce_sum(tf.square(grad_x), axis=[1, 2, 3, 4])
+                tf.reduce_sum(tf.square(real_grads), axis=[1, 2, 3, 4])
             )
 
             d_fake    = discriminator(fake_for_disc, training=True)
