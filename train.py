@@ -64,7 +64,7 @@ else:
 # Teacher-forcing schedule
 TF_RATE_INIT   = 1.0
 TF_MIN         = 0.1
-TF_DECAY_STEPS = 100_000
+TF_DECAY_STEPS = 500_000
 # Step number for profiler step markers — assigned each iteration in train_gan
 # so the @tf.function sees a fresh value without retracing.
 _profile_step_var = tf.Variable(0, trainable=False, dtype=tf.int64)
@@ -74,10 +74,10 @@ tf_step_counter = tf.Variable(0, trainable=False, dtype=tf.float32)
 #  LOSS WEIGHTS
 # ──────────────────────────────────────────────────────────────────────────────
 LAMBDA = 1
-TEMP   = 0.01
-GRAD   = 10
-FRAME  = 10000
-PERC   = 1000
+TEMP   = 0.0001
+GRAD   = 1
+FRAME  = 100
+PERC   = 1
 
 # ── R1 regularization (replaces WGAN-GP gradient penalty) ────────────────────
 # Computed every disc step (lazy R1 via tf.cond was attempted but the nested
@@ -89,7 +89,7 @@ R1_GAMMA = 1.0
 #  LR SCHEDULE
 # ──────────────────────────────────────────────────────────────────────────────
 TOTAL_STEPS  = 300_000
-WARMUP_STEPS = 2_000
+WARMUP_STEPS = 5_000
 
 
 def get_teacher_forcing_rate():
@@ -363,7 +363,7 @@ def train_gan(generator, discriminator, dataset, epochs=1000):
                     f"  l1={float(c*LAMBDA):.4f}  disc={float(d):.4f}"
                     f"  r1={float(e*R1_GAMMA):.4f}  temp={float(f*TEMP):.4f} grad={float(g*GRAD):.4f}"
                     f"  perc={float(h*PERC):.4f}  frame={float(i*FRAME):.4f}"
-                    f"  TF={float(tf_rate_val):.3f}"
+                    f"  TF={float(tf_rate_val):.3f} tf_step={int(tf_step_counter)}"
                 )
                 summarize_performance(
                     global_step, X_train, generator, discriminator,
