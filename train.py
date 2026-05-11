@@ -350,18 +350,19 @@ def train_gan(generator, discriminator, dataset, epochs=1000):
                 return
 
             log_loss_to_csv(
-                epoch, global_step, a, b, c, d, e, f, g, h, i,
+                epoch, global_step, a, b, c*LAMBDA, d, e*R1_GAMMA, f*TEMP, g*GRAD, h*PERC, i*FRAME,
                 csv_filename=os.path.join(folder, 'log.csv'),
             )
+# ──────────────────────────────────────────────────────────────────────────────
 
             if global_step % 1000 == 0:
                 tf_rate_val = get_teacher_forcing_rate()
                 print(
                     f"[Epoch {epoch:04d} | Step {step:05d} | GS {global_step:06d}]"
                     f"  gen={float(a):.4f}  gan={float(b):.4f}"
-                    f"  l1={float(c):.4f}  disc={float(d):.4f}"
-                    f"  r1={float(e):.4f}  temp={float(f):.4f}"
-                    f"  perc={float(h):.4f}  frame={float(i):.4f}"
+                    f"  l1={float(c*LAMBDA):.4f}  disc={float(d):.4f}"
+                    f"  r1={float(e*R1_GAMMA):.4f}  temp={float(f*TEMP):.4f} grad={float(g*GRAD):.4f}"
+                    f"  perc={float(h*PERC):.4f}  frame={float(i*FRAME):.4f}"
                     f"  TF={float(tf_rate_val):.3f}"
                 )
                 summarize_performance(
