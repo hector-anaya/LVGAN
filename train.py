@@ -391,7 +391,7 @@ def train_gan(generator, discriminator, dataset, epochs=1000):
                     f" (frame_loss={float(i):.4f})"
                 )
             if ckpt_manager is not None:
-                ckpt_manager.step(z, epoch)
+                ckpt_manager.step(global_step, epoch)
             global_step += 1
 
 
