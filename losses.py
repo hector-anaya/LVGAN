@@ -151,6 +151,18 @@ def discriminator_loss(disc_real_output, disc_generated_output):
             + tf.reduce_mean(tf.nn.softplus(disc_generated_output)))
 
 
+def kl_divergence_loss(mu, logvar):
+    """KL( N(mu, sigma^2) || N(0, I) ), summed over latent dim, mean over batch.
+
+    Used for the VAE encoder in CreateARLTCGAN — pulls the encoded posterior
+    toward the standard-normal prior so inference-time sampling from N(0, I)
+    matches the training distribution.
+    """
+    return -0.5 * tf.reduce_mean(
+        tf.reduce_sum(1.0 + logvar - tf.square(mu) - tf.exp(logvar), axis=-1)
+    )
+
+
 def generator_gan_loss(disc_generated_output):
     """Non-saturating logistic generator loss: softplus(-D(fake)).
 

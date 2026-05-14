@@ -85,7 +85,7 @@ def summarize_performance(step,X_train, g_model,d_model,folder,n_samples=1,g_los
         video = X_train   # (T, H, W, C)
     else:
         video   = X_train    # already (T, H, W, C)
-    X_fakeB = g_model(n=32,og_frames=video,noise=tf.random.uniform((1,400)))
+    X_fakeB, _, _ = g_model(n=32,og_frames=video,noise=tf.random.uniform((1,400)))
    # syn = ((X_fakeB+ 1) / 2.0)*((mask+1)/2)
    # syn=syn.numpy()
   #  cv2.imwrite(folder+'/'+str(step)+'.png',  cv2.cvtColor(syn[0]*255, cv2.COLOR_BGR2RGB))

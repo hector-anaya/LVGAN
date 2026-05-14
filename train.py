@@ -84,6 +84,12 @@ PERC   = 1
 # 2nd-order tape returns None in graph mode — see train_step for details).
 R1_GAMMA = 1.0
 
+# ── VAE KL weight ────────────────────────────────────────────────────────────
+# KL( q(z|first_frame) || N(0, I) ). Small constant to start; increase if
+# inference samples drift from training distribution, decrease on posterior
+# collapse (KL → 0, model ignores z).
+KL_BETA  = 0.01
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  LR SCHEDULE
@@ -236,10 +242,13 @@ def train_step(target, generator, discriminator):
 
     # ── Generate fakes once for the disc update (no gradient into generator) ─
     # Cuts the AR generator from 4 calls/step (3 disc + 1 gen) down to 2.
-    fake_for_disc = tf.stop_gradient(generator(
+    # Generator returns (video, mu, logvar); disc only needs the video, and
+    # since we stop_gradient, the VAE branch contributes no gradient anyway.
+    fake_video, _, _ = generator(
         n=minibatch[1], og_frames=target[0],
         noise=tf.random.uniform((1, 400)),
-    ))
+    )
+    fake_for_disc = tf.stop_gradient(fake_video)
 
     # ── 1× discriminator update with R1 regularization ───────────────────────
     # Uses tf.gradients (graph-mode native) for the input gradient instead of
@@ -268,7 +277,7 @@ def train_step(target, generator, discriminator):
     # ── 1× generator update ──────────────────────────────────────────────────
     with tf.profiler.experimental.Trace('gen_update'):
         with tf.GradientTape() as gen_tape:
-            gen_output = generator(
+            gen_output, mu, logvar = generator(
                 n=minibatch[1], og_frames=target[0],
                 teacher_forcing_rate=tf_rate,
                 noise=tf.random.uniform((1, 400)),
@@ -280,6 +289,8 @@ def train_step(target, generator, discriminator):
                 disc_generated_output, gen_output, target,
                 minibatch_size=minibatch[1],
             )
+            kl = kl_divergence_loss(mu, logvar)
+            gen_total_loss = gen_total_loss + KL_BETA * kl
 
         gen_grads = gen_tape.gradient(
             gen_total_loss, generator.trainable_variables

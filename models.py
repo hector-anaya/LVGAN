@@ -192,6 +192,36 @@ def define_generator(z_shape, image_shape=(256, 256, 3),
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  VAE ENCODER  (first-frame -> z_content during training)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_vae_encoder(image_shape=(256, 256, 3), z_dim=200):
+    """CNN that encodes a single frame to (mu, logvar) of dim z_dim.
+
+    Used by CreateARLTCGAN at TRAINING time only. At inference, z_content is
+    sampled directly from N(0, I) — see CreateARLTCGAN.call().
+    """
+    init = tf.random_normal_initializer(0., 0.02)
+    in_image = Input(shape=image_shape)
+
+    x = Conv2D(64,  4, strides=2, padding='same', kernel_initializer=init)(in_image)   # 128
+    x = LeakyReLU(0.2)(x)
+    x = Conv2D(128, 4, strides=2, padding='same', kernel_initializer=init)(x)          # 64
+    x = BatchNormalization()(x); x = LeakyReLU(0.2)(x)
+    x = Conv2D(256, 4, strides=2, padding='same', kernel_initializer=init)(x)          # 32
+    x = BatchNormalization()(x); x = LeakyReLU(0.2)(x)
+    x = Conv2D(512, 4, strides=2, padding='same', kernel_initializer=init)(x)          # 16
+    x = BatchNormalization()(x); x = LeakyReLU(0.2)(x)
+    x = Conv2D(512, 4, strides=2, padding='same', kernel_initializer=init)(x)          # 8
+    x = BatchNormalization()(x); x = LeakyReLU(0.2)(x)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)                                    # (B, 512)
+
+    mu     = Dense(z_dim, kernel_initializer=init, name='vae_mu')(x)
+    logvar = Dense(z_dim, kernel_initializer=init, name='vae_logvar')(x)
+    return Model(in_image, [mu, logvar], name='vae_encoder')
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  AUTOREGRESSIVE LTC-GAN WRAPPER
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -203,11 +233,25 @@ class CreateARLTCGAN(tf.keras.Model):
     both call() and sample_z_m() to prevent graph unrolling at long sequences.
     """
 
-    def __init__(self, generator, dim_z_motion, dim_z_content):
+    def __init__(self, generator, dim_z_motion, dim_z_content,
+                 image_shape=(256, 256, 3)):
         super().__init__()
         self.gen           = generator
         self.dim_z_motion  = tf.constant(dim_z_motion)
         self.dim_z_content = tf.constant(dim_z_content)
+        self._dim_z_content_int = int(dim_z_content)   # Python int for shapes
+
+        # VAE encoder: first_frame -> (mu, logvar) for z_content during training.
+        # Replaces the old sample_z_content() random sampling at train time.
+        self.vae_encoder = build_vae_encoder(image_shape, dim_z_content)
+
+        # Learnable start frame — replaces og_frames[0] as step-0 input to the
+        # U-Net. The model is now unconditional: at inference no real frame is
+        # ever fed in.
+        self.start_frame = tf.Variable(
+            tf.random.normal(image_shape, stddev=0.02),
+            trainable=True, name='start_frame'
+        )
 
         wiring = ncps.wirings.Random(
             dim_z_motion, output_dim=dim_z_motion, sparsity_level=0.5
@@ -221,6 +265,15 @@ class CreateARLTCGAN(tf.keras.Model):
             num_heads=4, key_dim=64, dropout=0.1
         )
 
+    # ── VAE encode + reparameterize ──────────────────────────────────────────
+    def encode_first_frame(self, first_frame):
+        """Run the VAE on a single (H,W,3) frame; return (z_content, mu, logvar)."""
+        x = tf.expand_dims(first_frame, 0)               # (1, H, W, 3)
+        mu, logvar = self.vae_encoder(x, training=True)  # each (1, dim_z_content)
+        eps = tf.random.normal(tf.shape(mu))
+        z_content = mu + tf.exp(0.5 * logvar) * eps
+        return z_content, mu, logvar
+
     # ── attention refinement ─────────────────────────────────────────────────
     def _refine_h_sequence(self, h_array, length, training):
         h_seq = tf.squeeze(h_array.stack(), axis=1)  # (length, 512)
@@ -228,17 +281,26 @@ class CreateARLTCGAN(tf.keras.Model):
         return h_seq[-1]                              # (512,)
 
     # ── forward pass (tf.while_loop — no graph unrolling) ────────────────────
-    def call(self, n, og_frames, teacher_forcing_rate=0,
+    def call(self, n, og_frames=None, teacher_forcing_rate=0,
              noise=None, training=False):
-        frames  = tf.TensorArray(dtype=tf.float32, size=n)
-        z       = tf.concat([self.sample_z_content(1, n),
-                             self.sample_z_m(1, n)], axis=1)
+        # ── z_content from VAE (training, og_frames given) or N(0,I) (inference) ─
+        if og_frames is not None:
+            z_content_single, mu, logvar = self.encode_first_frame(og_frames[0])
+        else:
+            z_content_single = tf.random.normal((1, self._dim_z_content_int))
+            mu     = tf.zeros((1, self._dim_z_content_int))
+            logvar = tf.zeros((1, self._dim_z_content_int))
 
+        z_content = tf.repeat(z_content_single, n, axis=0)   # (n, dim_z_content)
+        z_motion  = self.sample_z_m(1, n)                    # (n, dim_z_motion)
+        z         = tf.concat([z_content, z_motion], axis=1) # (n, total)
+
+        frames = tf.TensorArray(dtype=tf.float32, size=n)
         h_array = tf.TensorArray(
             dtype=tf.float32, size=n + 1, clear_after_read=False
         )
         h_array     = h_array.write(0, tf.random.normal((1, 512)))
-        input_frame = og_frames[0]
+        input_frame = self.start_frame                       # learnable, not og_frames[0]
         ATTN_EVERY  = 4
 
         def _gen_cond(i, h_array, frames, input_frame):
@@ -302,7 +364,7 @@ class CreateARLTCGAN(tf.keras.Model):
         )
 
         _ = h_array.stack()
-        return tf.expand_dims(frames.stack(), axis=0)
+        return tf.expand_dims(frames.stack(), axis=0), mu, logvar
 
     # ── latent sampling ───────────────────────────────────────────────────────
     def get_ltc_initial_state(self, num_samples):
