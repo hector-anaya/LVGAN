@@ -390,7 +390,8 @@ def train_gan(generator, discriminator, dataset, epochs=1000):
                     f"  ↳ New best saved"
                     f" (frame_loss={float(i):.4f})"
                 )
-
+            if ckpt_manager is not None:
+                ckpt_manager.step(z, epoch)
             global_step += 1
 
 
