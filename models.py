@@ -203,11 +203,17 @@ class CreateARLTCGAN(tf.keras.Model):
     both call() and sample_z_m() to prevent graph unrolling at long sequences.
     """
 
-    def __init__(self, generator, dim_z_motion, dim_z_content):
+    def __init__(self, generator, dim_z_motion, dim_z_content,
+                 cond_frames=8):
         super().__init__()
         self.gen           = generator
         self.dim_z_motion  = tf.constant(dim_z_motion)
         self.dim_z_content = tf.constant(dim_z_content)
+        # Number of leading real frames fed as conditioning context. The first
+        # `cond_frames` AR steps always take the real frame as input (both
+        # training and inference) to prime the LTC hidden state; the model
+        # only rolls out on its own outputs after that.
+        self.cond_frames   = cond_frames
 
         wiring = ncps.wirings.Random(
             dim_z_motion, output_dim=dim_z_motion, sparsity_level=0.5
@@ -275,22 +281,33 @@ class CreateARLTCGAN(tf.keras.Model):
 
             frames = frames.write(i, fake[0])
 
-            # Teacher forcing / autoregressive input selection
+            # ── input selection for next step ────────────────────────────────
+            safe_idx   = tf.minimum(i + 1, n - 1)
+            # Conditioning window: first `cond_frames` inputs are always real
+            # (steps 0..cond_frames-1 see og_frames). Holds for training AND
+            # inference — at generation time you supply `cond_frames` seed
+            # frames and the model predicts the rest.
+            in_context = tf.less(i + 1, self.cond_frames)
+
             if training:
                 def _teacher_or_student():
-                    use_real  = tf.less(
+                    use_real = tf.less(
                         tf.random.uniform([], 0.0, 1.0), teacher_forcing_rate
                     )
-                    safe_idx  = tf.minimum(i + 1, n - 1)
-                    real_next = og_frames[safe_idx]
                     return tf.cond(use_real,
-                                   lambda: real_next,
+                                   lambda: og_frames[safe_idx],
                                    lambda: fake[0])
-                next_input = tf.cond(
+                after_context = tf.cond(
                     i + 1 < n, _teacher_or_student, lambda: fake[0]
                 )
             else:
-                next_input = fake[0]
+                after_context = fake[0]
+
+            next_input = tf.cond(
+                in_context,
+                lambda: og_frames[safe_idx],
+                lambda: after_context,
+            )
 
             return i + 1, h_array, frames, next_input
 
