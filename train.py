@@ -16,6 +16,7 @@ import argparse
 import os
 
 parser = argparse.ArgumentParser(description='Train .')
+parser.add_argument('--dataset', type=str,required=True, default='taichi', help='Dataset to use (e.g., "taichi", "sky", "ucf101", "ffs")')
 parser.add_argument('--folder', type=str, default='exp_new_test', help='Folder to save logs and models')
 parser.add_argument('--gpu', type=str, default='0', help='GPU device to use (e.g., "0", "1", "0,1")')
 parser.add_argument('--islocal', type=bool, default=0, help='Flag to indicate local execution (for debugging)')
@@ -56,11 +57,19 @@ MAX_STRIDE = 1   # stride fixed to 1 for TaiChi
 # TaiChi dataset has a flat structure: BASE_DIR/video_name/*.jpg
 # BASE_DIR   = '/home/hector.anaya/Datasets/sky_timelapse/sky_train'
 
-
 if args.islocal:
     BASE_DIR='/mnt/d/PHD/Experiments/Dataset/UCFCLASS/TaiChi'
 else:
-    BASE_DIR='/usuarios03/hector.anaya1/Datasets/UCF101processed'
+    if args.dataset == 'taichi':
+        BASE_DIR='/usuarios03/hector.anaya1/Datasets/TaiChi'
+    elif args.dataset == 'sky':
+        BASE_DIR='/usuarios03/hector.anaya1/Datasets/sky_timelapse/sky_train'
+    elif args.dataset == 'ucf101':
+        BASE_DIR='/usuarios03/hector.anaya1/Datasets/UCF101processed'
+    elif args.dataset == 'ffs':
+        BASE_DIR='/usuarios03/hector.anaya1/Datasets/ffs_train'
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")  
 # Teacher-forcing schedule
 TF_RATE_INIT   = 1.0
 TF_MIN         = 0.1
