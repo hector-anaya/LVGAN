@@ -179,7 +179,7 @@ def define_generator(z_shape, image_shape=(256, 256, 3),
 
     # NOTE: d5/d6/d7 have skip=False (exp10 change vs exp8)
     d4 = decoder_block(b3, e4, 512,               skip=True)    # 16
-    d5 = decoder_block(d4, e3, 256, dropout=False, skip=False)  # 32
+    d5 = decoder_block(d4, e3, 256, dropout=False, skip=True)  # 32
     d6 = decoder_block(d5, e2, 128, dropout=False, skip=False)  # 64
     d7 = decoder_block(d6, e1,  64, dropout=False, skip=False)  # 128
 

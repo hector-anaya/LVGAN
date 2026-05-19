@@ -50,7 +50,7 @@ folder     = args.folder.rstrip('/') + '/'
 SEQ_LENGHT = 128
 FRAME_SIZE = (256, 256)
 minibatch  = (8, 16)
-MAX_STRIDE = 1   # stride fixed to 1 for TaiChi
+MAX_STRIDE = 4   # stride fixed to 1 for TaiChi
 
 # TaiChi dataset has a flat structure: BASE_DIR/video_name/*.jpg
 # BASE_DIR   = '/home/hector.anaya/Datasets/sky_timelapse/sky_train'
@@ -88,8 +88,8 @@ PEN    = 10
 # ──────────────────────────────────────────────────────────────────────────────
 #  LR SCHEDULE
 # ──────────────────────────────────────────────────────────────────────────────
-TOTAL_STEPS  = 300_000
-WARMUP_STEPS = 2_000
+TOTAL_STEPS  = 500_000
+WARMUP_STEPS = 10_000
 
 
 def get_teacher_forcing_rate():
@@ -316,7 +316,7 @@ def train_gan(generator, discriminator, dataset, steps=None):
         )
 
         log_loss_to_csv(
-            0, global_step, a, b, c, d, e, f, g, h, i,
+            global_step, global_step, a, b, c, d, e, f, g, h, i,
             csv_filename=os.path.join(folder, 'log.csv'),
         )
 
