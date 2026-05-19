@@ -16,12 +16,11 @@ import argparse
 import os
 
 parser = argparse.ArgumentParser(description='Train .')
+parser.add_argument('--dataset', type=str, required=True, default='taichi', help='Dataset to use (e.g., "taichi", "sky", "ucf101", "ffs")')
 parser.add_argument('--folder', type=str, default='exp_new_test', help='Folder to save logs and models')
 parser.add_argument('--gpu', type=str, default='0', help='GPU device to use (e.g., "0", "1", "0,1")')
 parser.add_argument('--islocal', type=bool, default=0, help='Flag to indicate local execution (for debugging)')
-parser.add_argument('--profile', action='store_true', help='Profile a short window of steps to <folder>/profile/ and exit')
-parser.add_argument('--profile_warmup', type=int, default=5, help='Steps to warm up before profiler starts')
-parser.add_argument('--profile_steps', type=int, default=10, help='Number of steps to capture in the profile')
+parser.add_argument('--steps', type=int, default=300_000, help='Number of training steps to run (the dataset repeats indefinitely)')
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -56,18 +55,23 @@ MAX_STRIDE = 1   # stride fixed to 1 for TaiChi
 # TaiChi dataset has a flat structure: BASE_DIR/video_name/*.jpg
 # BASE_DIR   = '/home/hector.anaya/Datasets/sky_timelapse/sky_train'
 
-
 if args.islocal:
     BASE_DIR='/mnt/d/PHD/Experiments/Dataset/UCFCLASS/TaiChi'
 else:
-    BASE_DIR='/home/hector.anaya/Datasets/TaiChi'
+    if args.dataset == 'taichi':
+        BASE_DIR='/usuarios03/hector.anaya1/Datasets/TaiChi'
+    elif args.dataset == 'sky':
+        BASE_DIR='/usuarios03/hector.anaya1/Datasets/sky_timelapse/sky_train'
+    elif args.dataset == 'ucf101':
+        BASE_DIR='/usuarios03/hector.anaya1/Datasets/UCF101processed'
+    elif args.dataset == 'ffs':
+        BASE_DIR='/usuarios03/hector.anaya1/Datasets/ffs_train'
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")  
 # Teacher-forcing schedule
 TF_RATE_INIT   = 1.0
 TF_MIN         = 0.1
 TF_DECAY_STEPS = 100_000
-# Step number for profiler step markers — assigned each iteration in train_gan
-# so the @tf.function sees a fresh value without retracing.
-_profile_step_var = tf.Variable(0, trainable=False, dtype=tf.int64)
 tf_step_counter = tf.Variable(0, trainable=False, dtype=tf.float32)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -103,12 +107,13 @@ def get_teacher_forcing_rate():
 
 MAX_STRIDE = 2  # adjust to your value
 
-# ── pre-compute strided frame paths in pure Python (once) ─────────────────
-def sample_frame_paths(video_dir, seq_length, max_stride):
+# ── random `seq_length`-frame window sampler ──────────────────────────────
+# Wrapped in tf.py_function so .repeat() draws a *fresh* random window per
+# video on every pass through the dataset (instead of one fixed window).
+def _sample_window_paths(video_dir, seq_length, max_stride):
+    video_dir = video_dir.numpy().decode("utf-8")
     frame_paths = sorted(glob(os.path.join(video_dir, "*.jpg")))
     total = len(frame_paths)
-    if total == 0:
-        return None
 
     stride = np.random.randint(1, max_stride + 1)
     required_span = 1 + (seq_length - 1) * stride
@@ -120,31 +125,18 @@ def sample_frame_paths(video_dir, seq_length, max_stride):
         start = np.random.randint(0, total)
         indices = (start + np.arange(seq_length) * stride) % total
 
-    return [frame_paths[i] for i in indices]
+    return np.array([frame_paths[i].encode("utf-8") for i in indices])
 
 
-# collect video dirs (same logic as before)
-def make_paths(BASE_DIR,seq):
-    #video_dir=[]
-    #for name in os.listdir(BASE_DIR):
-     #   if os.path.isdir(os.path.join(BASE_DIR, name)):
-      #      # print(name)
-       #     for name_in in os.listdir(os.path.join(BASE_DIR, name)):
-        #        if os.path.isdir(os.path.join(BASE_DIR, name, name_in)) and len(glob(os.path.join(BASE_DIR, name, name_in, "*.jpg"))) >= seq:
-                    # print(name_in)
-         #           video_dir.append(os.path.join(BASE_DIR, name, name_in))
-#    video_dir.sort()
-#    print(f"Found {len(video_dir)} video directories.")
- #   return video_dir
-    video_dirs=[]
+# collect video dirs (videos must have at least `seq` frames)
+def make_paths(BASE_DIR, seq):
+    video_dirs = []
     for name in os.listdir(BASE_DIR):
-        if os.path.isdir(os.path.join(BASE_DIR, name)):
-            if os.path.isdir(os.path.join(BASE_DIR, name)) and len(glob(os.path.join(BASE_DIR, name, "*.jpg"))) >= SEQ_LENGHT:
-                # print(name_in)
-                video_dirs.append(os.path.join(BASE_DIR, name))
+        if os.path.isdir(os.path.join(BASE_DIR, name)) and \
+           len(glob(os.path.join(BASE_DIR, name, "*.jpg"))) >= seq:
+            video_dirs.append(os.path.join(BASE_DIR, name))
     video_dirs.sort()
     print(f"Found {len(video_dirs)} video directories.")
-   # print(f"Found {len(video_dir)} video directories.")
     return video_dirs
 
 def load_frame(path):
@@ -158,20 +150,30 @@ def load_frame(path):
 
 def make_dataset(video_dirs, seq_length, max_stride):
     """
-    Re-samples strides every time make_dataset() is called.
-    Call once per epoch to get fresh random strides.
+    Infinite dataset of single `seq_length`-frame clips (one clip per element).
+
+    from_tensor_slices(video_dirs) → shuffle → repeat → a py_function picks a
+    fresh random window per video on each pass → decode frames. Because the
+    stream is infinite, the training loop is responsible for stopping after a
+    fixed number of steps (args.steps).
     """
-    # sample all paths in Python — O(n_videos), negligible cost
-    all_selected = []
-    for vd in video_dirs:
-        paths = sample_frame_paths(vd, seq_length, max_stride)
-        if paths is not None:
-            all_selected.append(paths)          # list of SEQ_LENGTH strings
+    path_ds = (tf.data.Dataset
+               .from_tensor_slices(video_dirs)
+               .shuffle(len(video_dirs), reshuffle_each_iteration=True)
+               .repeat())
 
-    # shape: (n_videos, SEQ_LENGTH) — from_tensor_slices gives one row per video
-    path_ds = tf.data.Dataset.from_tensor_slices(all_selected)
+    def _sample(video_dir):
+        paths = tf.py_function(
+            func=lambda vd: _sample_window_paths(vd, seq_length, max_stride),
+            inp=[video_dir],
+            Tout=tf.string,
+        )
+        paths.set_shape([seq_length])
+        return paths
 
-    # map load_frame over each row (SEQ_LENGTH paths) → (SEQ_LENGTH, H, W, C)
+    path_ds = path_ds.map(_sample, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # map load_frame over the seq_length paths → (seq_length, H, W, C)
     video_ds = path_ds.map(
         lambda paths: tf.map_fn(
             load_frame,
@@ -257,35 +259,33 @@ def train_step(target, generator, discriminator):
         )
         return i + 1, penalty, disc_loss
 
-    with tf.profiler.experimental.Trace('disc_3x'):
-        _, penalty, disc_loss = tf.while_loop(
-            _disc_cond, _disc_body,
-            loop_vars=[tf.constant(0), tf.constant(0.0), tf.constant(0.0)],
-            parallel_iterations=1,
-        )
+    _, penalty, disc_loss = tf.while_loop(
+        _disc_cond, _disc_body,
+        loop_vars=[tf.constant(0), tf.constant(0.0), tf.constant(0.0)],
+        parallel_iterations=1,
+    )
 
     # ── 1× generator update ──────────────────────────────────────────────────
-    with tf.profiler.experimental.Trace('gen_update'):
-        with tf.GradientTape() as gen_tape:
-            gen_output = generator(
-                n=minibatch[1], og_frames=target[0],
-                teacher_forcing_rate=tf_rate,
-                noise=tf.random.uniform((1, 400)),
-                training=True,
-            )
-            disc_generated_output = discriminator(gen_output)
-            (gen_total_loss, gen_gan_loss, gen_l1_loss,
-             temp, perp, grad, fram) = generator_loss(
-                disc_generated_output, gen_output, target,
-                minibatch_size=minibatch[1],
-            )
+    with tf.GradientTape() as gen_tape:
+        gen_output = generator(
+            n=minibatch[1], og_frames=target[0],
+            teacher_forcing_rate=tf_rate,
+            noise=tf.random.uniform((1, 400)),
+            training=True,
+        )
+        disc_generated_output = discriminator(gen_output)
+        (gen_total_loss, gen_gan_loss, gen_l1_loss,
+         temp, perp, grad, fram) = generator_loss(
+            disc_generated_output, gen_output, target,
+            minibatch_size=minibatch[1],
+        )
 
-        gen_grads = gen_tape.gradient(
-            gen_total_loss, generator.trainable_variables
-        )
-        generator_optimizer.apply_gradients(
-            zip(gen_grads, generator.trainable_variables)
-        )
+    gen_grads = gen_tape.gradient(
+        gen_total_loss, generator.trainable_variables
+    )
+    generator_optimizer.apply_gradients(
+        zip(gen_grads, generator.trainable_variables)
+    )
 
     tf_step_counter.assign_add(1.0)
 
@@ -293,92 +293,57 @@ def train_step(target, generator, discriminator):
             disc_loss, penalty, temp, perp, grad, fram)
 
 
-@tf.function
-def train_step_multi(target, generator, discriminator):
-    """Average losses over minibatch[0] mini-clip steps.
-    Outer Trace is INSIDE the @tf.function so the step marker is captured on
-    the device timeline (host-side wrapping in eager mode ends before async
-    GPU work finishes, which is why TB's Overview page sees "no step marker").
-    Inner mini-clip loop is Python-unrolled so each iteration emits its own
-    Trace region.
-    """
-    with tf.profiler.experimental.Trace('train_step', step_num=_profile_step_var):
-        aa = tf.zeros(9)
-        for j in range(minibatch[0]):
-            k      = j * (minibatch[1] - 1)
-            X_mini = target[k : minibatch[1] + k]
-            with tf.profiler.experimental.Trace('mini_clip', step_num=j):
-                aa = aa + train_step(
-                    tf.expand_dims(X_mini, axis=0), generator, discriminator
-                )
-        return aa / tf.cast(minibatch[0], tf.float32)
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 #  MAIN TRAINING LOOP
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train_gan(generator, discriminator, dataset, epochs=1000):
+def train_gan(generator, discriminator, dataset, steps=None):
+    """Step-based loop. `dataset` is the infinite stream from make_dataset()
+    yielding one `minibatch[1]`-frame clip per element; we run for `steps`
+    global steps (default args.steps) rather than iterating an epoch."""
+    if steps is None:
+        steps = args.steps
     os.makedirs(folder, exist_ok=True)
-    global_step = 0
-    best_loss   = np.inf
+    best_loss = np.inf
 
-    profile_dir   = os.path.join(folder, 'profile')
-    profile_start = args.profile_warmup
-    profile_stop  = args.profile_warmup + args.profile_steps
+    for global_step, batch in enumerate(dataset):
+        if global_step >= steps:
+            break
+        X_train = batch[0]                       # (minibatch[1], H, W, 3)
 
-    for epoch in range(epochs):
-        video_dirs = make_paths(BASE_DIR, SEQ_LENGHT)
-        video_dataset    = make_dataset(video_dirs, SEQ_LENGHT, 1)
-        for video in video_dataset.take(1):
-            print(f"[DEBUG] sample video shape={video.shape}", flush=True)
-        for step, batch in enumerate(video_dataset):
-            X_train = batch[0]
+        a, b, c, d, e, f, g, h, i = train_step(
+            tf.expand_dims(X_train, axis=0), generator, discriminator
+        )
 
-            if args.profile and global_step == profile_start:
-                tf.profiler.experimental.start(profile_dir)
-                print(f"[profiler] started — capturing {args.profile_steps} steps to {profile_dir}")
-            _profile_step_var.assign(global_step)
-            a, b, c, d, e, f, g, h, i = train_step_multi(
-                    X_train, generator, discriminator
-                )
+        log_loss_to_csv(
+            0, global_step, a, b, c, d, e, f, g, h, i,
+            csv_filename=os.path.join(folder, 'log.csv'),
+        )
 
-            if args.profile and global_step == profile_stop - 1:
-                tf.profiler.experimental.stop()
-                print(f"[profiler] stopped — view with: tensorboard --logdir {profile_dir}")
-                return
-
-            log_loss_to_csv(
-                epoch, global_step, a, b, c, d, e, f, g, h, i,
-                csv_filename=os.path.join(folder, 'log.csv'),
+        if global_step % 1000 == 0:
+            tf_rate_val = get_teacher_forcing_rate()
+            print(
+                f"[Step {global_step:06d}/{steps:06d}]"
+                f"  gen={float(a):.4f}  gan={float(b):.4f}"
+                f"  l1={float(c):.4f}  disc={float(d):.4f}"
+                f"  gp={float(e):.4f}  temp={float(f):.4f}"
+                f"  perc={float(h):.4f}  frame={float(i):.4f}"
+                f"  TF={float(tf_rate_val):.3f}"
+            )
+            summarize_performance(
+                global_step, X_train, generator, discriminator,
+                folder, n_samples=minibatch[1] // 2, g_loss=float(a),
             )
 
-            if global_step % 1000 == 0:
-                tf_rate_val = get_teacher_forcing_rate()
-                print(
-                    f"[Epoch {epoch:04d} | Step {step:05d} | GS {global_step:06d}]"
-                    f"  gen={float(a):.4f}  gan={float(b):.4f}"
-                    f"  l1={float(c):.4f}  disc={float(d):.4f}"
-                    f"  gp={float(e):.4f}  temp={float(f):.4f}"
-                    f"  perc={float(h):.4f}  frame={float(i):.4f}"
-                    f"  TF={float(tf_rate_val):.3f}"
-                )
-                summarize_performance(
-                    global_step, X_train, generator, discriminator,
-                    folder, n_samples=minibatch[1] // 2, g_loss=float(a),
-                )
-
-            if float(i) * FRAME < best_loss:
-                best_loss = float(i) * FRAME
-                generator.save_weights(
-                    os.path.join(folder, 'best_generator.h5')
-                )
-                print(
-                    f"  ↳ New best saved"
-                    f" (frame_loss={float(i):.4f})"
-                )
-
-            global_step += 1
+        if float(i) * FRAME < best_loss:
+            best_loss = float(i) * FRAME
+            generator.save_weights(
+                os.path.join(folder, 'best_generator.h5')
+            )
+            print(
+                f"  ↳ New best saved"
+                f" (frame_loss={float(i):.4f})"
+            )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -414,7 +379,7 @@ if __name__ == '__main__':
         gen_opt        = generator_optimizer,
         disc_opt       = discriminator_optimizer,
         disc2_opt      = None,
-        n_frames       = SEQ_LENGHT,
+        n_frames       = minibatch[1],
         # build_disc_fn  = lambda: build_stylegan_v_discriminator(
         #                      frame_size=FRAME_SIZE, k_frames=K_FRAMES),
         build_disc_fn=lambda: build_discriminator_3d(
@@ -430,12 +395,12 @@ if __name__ == '__main__':
         discriminator=restored_disc
  
     # -- dataset & train -----------------------------------------------------
-    video_dirs = make_paths(BASE_DIR, SEQ_LENGHT)
-    video_dataset    = make_dataset(video_dirs, SEQ_LENGHT, 1)
+    video_dirs = make_paths(BASE_DIR, minibatch[1])
+    video_dataset    = make_dataset(video_dirs, minibatch[1], 4)
     for video in video_dataset.take(1):
         print(f"[DEBUG] sample video shape={video.shape}", flush=True)
     # Quick shape check
     for v in video_dataset.take(1):
         print("Sample video shape:", v.shape)
 
-    train_gan(generator, discriminator, video_dataset, epochs=1000)
+    train_gan(generator, discriminator, video_dataset)
