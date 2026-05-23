@@ -334,7 +334,8 @@ def train_gan(generator, discriminator, dataset, steps=None):
                 global_step, X_train, generator, discriminator,
                 folder, n_samples=minibatch[1] // 2, g_loss=float(a),
             )
-
+        if ckpt_manager is not None:
+            ckpt_manager.step(z, epoch)
         if float(i) * FRAME < best_loss:
             best_loss = float(i) * FRAME
             generator.save_weights(
