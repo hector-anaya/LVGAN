@@ -1,0 +1,2 @@
+# Keep shell scripts LF so they run on Linux/SLURM even when edited on Windows
+*.sh text eol=lf

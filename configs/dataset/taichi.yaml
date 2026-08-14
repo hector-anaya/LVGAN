@@ -1,0 +1,8 @@
+# @package _group_
+
+name: taichi_${dataset.resolution}
+# TaiChi-HD is usually reported at 128x128 in the video-GAN literature
+# (MoCoGAN-HD / DIGAN / StyleGAN-V follow-ups). Override with
+# `dataset.resolution=256` if you extracted the frames at 256x256.
+resolution: 128
+fps: 25

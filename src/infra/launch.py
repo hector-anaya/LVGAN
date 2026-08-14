@@ -93,7 +93,7 @@ def main(cfg: DictConfig):
                 output_str = result.stdout.decode("utf-8").strip("\n") # It has a format of "Submitted batch job 17033559"
                 if not quiet or i == 0:
                     print(output_str)
-                curr_job_id = re.findall(r"^Submitted\ batch\ job\ \d{5,8}$", output_str)
+                curr_job_id = re.findall(r"^Submitted\ batch\ job\ \d+$", output_str)
                 assert len(curr_job_id) == 1, f"Bad output: `{output_str}`"
                 curr_job_id = int(curr_job_id[0][len('Submitted batch job '):])
     else:

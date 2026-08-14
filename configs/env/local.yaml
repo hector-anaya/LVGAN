@@ -2,3 +2,18 @@
 
 python_bin: ${env.project_path}/env/bin/python
 project_path: ${hydra:runtime.cwd}
+
+# Our cluster does not define GPU node features; leave empty so no --constraint is passed.
+# Set this to a valid feature (see `sinfo -o "%N %f"`) if you need to pin a GPU type.
+slurm_constraint: ""
+
+# gpuserver02 has one wedged GPU (UUID prefix below, bus A4:00.0). Any allocation that
+# CONTAINS it fails cuInit 101 for the whole process (CUDA_VISIBLE_DEVICES can't mask it).
+# This guard aborts the job in <1s if SLURM handed us that GPU, so the job-sequence
+# (afterany + training.resume=latest) resubmits instead of wasting the walltime.
+# Remove/update BAD_GPU once admins reset or de-list the GPU.
+before_train_commands:
+  - 'BAD_GPU=7f11ef35'
+  - 'echo "[gpu-guard] allocation:"; nvidia-smi -L'
+  - 'if nvidia-smi -L | grep -q "$BAD_GPU"; then echo "[gpu-guard] dead GPU $BAD_GPU is in this allocation -> waiting 180s then aborting for resubmit"; sleep 180; exit 1; fi'
+  - 'echo "[gpu-guard] clean allocation, starting training"'

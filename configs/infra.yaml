@@ -40,4 +40,6 @@ env_args:
 env_args_str:
   _target_: src.infra.utils.cfg_to_args_str
   cfg: ${env_args}
-  use_dashes: true
+  use_dashes: false
+  # sbatch --export wants a comma-separated list of VAR=value pairs (no spaces/dashes)
+  separator: ","

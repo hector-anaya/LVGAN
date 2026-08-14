@@ -388,10 +388,19 @@ def random_frame_sampling(cfg: Dict, total_video_len: int, use_fractional_t: boo
     min_time_diff = cfg["num_frames_per_video"] - 1
     max_time_diff = min(total_video_len - 1, cfg.get('max_dist', float('inf')))
 
+    # Video is shorter than num_frames_per_video — return the available frames with the last one repeated.
+    # Without this, the sampler crashes on short clips (e.g. some SkyTimelapse videos).
+    if max_time_diff < min_time_diff:
+        return np.array([min(i, max(total_video_len - 1, 0)) for i in range(cfg["num_frames_per_video"])])
+
     if type(cfg.get('total_dists')) in (list, tuple):
         time_diff_range = [d for d in cfg['total_dists'] if min_time_diff <= d <= max_time_diff]
     else:
         time_diff_range = range(min_time_diff, max_time_diff)
+
+    # No total_dists entry fits — fall back to the largest valid gap for this video.
+    if len(time_diff_range) == 0:
+        time_diff_range = [max_time_diff]
 
     time_diff: int = random.choice(time_diff_range)
     if use_fractional_t:

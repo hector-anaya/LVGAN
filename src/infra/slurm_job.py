@@ -33,8 +33,14 @@ def main(cfg: DictConfig):
     else:
         os.makedirs(target_data_dir_base, exist_ok=True)
 
-    copyfile(cfg.dataset.path_for_slurm_job, cfg.dataset.path)
-    print(f'Copied the data: {cfg.dataset.path_for_slurm_job} => {cfg.dataset.path}. Starting the training...')
+    # Skip staging when the dataset already lives where training reads it
+    # (i.e. `path_for_slurm_job` and `path` point to the same file), otherwise
+    # copyfile() raises SameFileError.
+    if os.path.realpath(cfg.dataset.path_for_slurm_job) == os.path.realpath(cfg.dataset.path):
+        print(f'Data already in place at {cfg.dataset.path}, skipping the copy. Starting the training...')
+    else:
+        copyfile(cfg.dataset.path_for_slurm_job, cfg.dataset.path)
+        print(f'Copied the data: {cfg.dataset.path_for_slurm_job} => {cfg.dataset.path}. Starting the training...')
 
     training_cmd = open('training_cmd.sh').read()
     print('<=== TRAINING COMMAND ===>')
