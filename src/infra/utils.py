@@ -115,10 +115,11 @@ def are_there_uncommitted_changes() -> bool:
 
 #----------------------------------------------------------------------------
 
-def cfg_to_args_str(cfg: DictConfig, use_dashes=True) -> str:
+def cfg_to_args_str(cfg: DictConfig, use_dashes=True, separator=' ') -> str:
     dashes = '--' if use_dashes else ''
 
-    return ' '.join([f'{dashes}{p}={cfg[p]}' for p in cfg])
+    # Skip keys with empty/None values so we don't emit dangling flags like `--constraint=`
+    return separator.join([f'{dashes}{p}={cfg[p]}' for p in cfg if cfg[p] is not None and str(cfg[p]) != ''])
 
 #----------------------------------------------------------------------------
 

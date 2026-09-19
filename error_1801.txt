@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/usuarios03/hector.anaya1/Experiments/stylegan-v/src/infra/launch.py", line 52, in main
+    create_project_dir(
+  File "/usuarios03/hector.anaya1/Experiments/stylegan-v/src/infra/utils.py", line 65, in create_project_dir
+    if ignore_uncommited_changes or click.confirm("There are uncommited changes. Continue?", default=False):
+  File "/usuarios03/hector.anaya1/Experiments/stylegan-v/env/lib/python3.9/site-packages/click/termui.py", line 236, in confirm
+    raise Abort() from None
+click.exceptions.Abort
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

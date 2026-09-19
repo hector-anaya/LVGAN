@@ -1,6 +1,9 @@
 # @package _group_
 
-path: data/${dataset.name}.zip
+path: /usuarios03/hector.anaya1/Datasets/Faceforencics_all_preprocessed.zip
+#path: /usuarios03/hector.anaya1/Datasets/UCF101.zip
+#path : /usuarios03/hector.anaya1/Datasets/taichiHD_train.zip
+#path: /usuarios03/hector.anaya1/Datasets/sky_train_flat.zip
 sampling: ${sampling}
 c_dim: 0
 max_num_frames: 1024
@@ -11,4 +14,7 @@ resolution: 256
 
 # When used with slurm, this will take the dataset from `path_for_slurm_job`
 # and will copy it into the `path` location
-path_for_slurm_job: ${env.datasets_dir}/${dataset.name}.zip
+#path_for_slurm_job: /usuarios03/hector.anaya1/Datasets/sky_train_flat.zip
+path_for_slurm_job: /usuarios03/hector.anaya1/Datasets/Faceforencics_all_preprocessed.zip
+#path_for_slurm_job: /usuarios03/hector.anaya1/Datasets/UCF101.zip
+#path_for_slurm_job: /usuarios03/hector.anaya1/Datasets/taichiHD_train.zip

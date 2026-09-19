@@ -8,7 +8,7 @@ kimg: 25000
 metrics: ["fvd2048_16f", "fvd2048_128f", "fvd2048_128f_subsample8f", "fid50k_full"]
 
 aug: ada # One of ['noaug', 'ada', 'fixed']
-mirror: true # Enable dataset x-flips [default: false]
+mirror: false # Enable dataset x-flips [default: false]
 batch_size: 64
 resume: ~
 

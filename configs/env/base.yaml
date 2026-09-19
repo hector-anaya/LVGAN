@@ -12,4 +12,4 @@ symlinks_to_create:
   - ${env.project_path}/data
 tmp_dir: "/tmp"
 datasets_dir: ~
-slurm_constraint: v100
+slurm_constraint: ''

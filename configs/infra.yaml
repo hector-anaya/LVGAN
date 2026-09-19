@@ -1,6 +1,6 @@
 # @package _group_
 
-num_gpus: 4
+num_gpus: 2
 print_only: false
 
 # Experiment directory naming conventions
@@ -18,15 +18,15 @@ slurm_log_dir: ${project_release_dir}
 use_qos: false
 sbatch_args:
   constraint: ${env.slurm_constraint}
-  time: "1-0"
-  gres: gpu:${num_gpus}
+  time: "UNLIMITED"
+  gres: gpu:2
   cpus-per-task: 5
   mem:
     _target_: src.infra.utils.num_gpus_to_mem
-    num_gpus: ${num_gpus}
-    mem_per_gpu: 64
+    num_gpus: 2
+    mem_per_gpu: 40
   # mem-per-gpu: 64G
-  cpus-per-gpu: 5
+ # cpus-per-gpu: 5
   comment: ${experiment_name}
 sbatch_args_str:
   _target_: src.infra.utils.cfg_to_args_str
@@ -40,4 +40,6 @@ env_args:
 env_args_str:
   _target_: src.infra.utils.cfg_to_args_str
   cfg: ${env_args}
-  use_dashes: true
+  use_dashes: false
+  # sbatch --export wants a comma-separated list of VAR=value pairs (no spaces/dashes)
+  separator: ","

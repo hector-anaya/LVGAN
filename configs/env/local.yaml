@@ -2,3 +2,10 @@
 
 python_bin: ${env.project_path}/env/bin/python
 project_path: ${hydra:runtime.cwd}
+before_train_commands:
+ - echo "SLURM CVD=$CUDA_VISIBLE_DEVICES"
+ - export CUDA_VISIBLE_DEVICES=0,1 
+ - nvidia-smi -L
+ - export TORCH_EXTENSIONS_DIR=/tmp/torch_ext_$(date +%s)
+ - mkdir -p $TORCH_EXTENSIONS_DIR
+

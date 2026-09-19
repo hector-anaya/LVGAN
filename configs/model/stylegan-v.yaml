@@ -17,8 +17,40 @@ generator:
     motion_z_distance: ${model.generator.time_enc.min_period_len}
 
     # Parameters of the 2-layer conv1d-based motion generation network
-    gen_strategy: conv
+    # options: conv | autoregressive | exp_cf | cfc | ncps_ltc | ncps_cfc
+    # ('ltc' is accepted as a deprecated alias for 'exp_cf')
+    gen_strategy: exp_cf
     kernel_size: 11
+
+    # Exponential closed-form network (gen_strategy=exp_cf). Config keys keep the
+    # historical `ltc_` prefix so existing experiment dirs and resumes keep working.
+    # ltc_hidden_dim defaults to motion.z_dim if omitted
+    ltc_hidden_dim: 512
+    ltc_ode_unfolds: 6          # closed-form sub-steps per motion_z_distance interval
+    ltc_learn_tau_bias: true    # false ablates the redundant per-channel log_tau_0
+
+    # Closed-form Continuous-time (CfC) network parameters (used when gen_strategy=cfc)
+    # cfc_hidden_dim defaults to motion.z_dim if omitted; CfC needs no ode_unfolds
+    cfc_hidden_dim: 512
+    cfc_learn_tau_bias: true    # false ablates the redundant per-channel log_tau_0
+
+    # Reference `ncps` LTC (gen_strategy=ncps_ltc). MUST stay fp32: the semi-implicit
+    # update divides by cm/dt + gleak + w_act, which is not bounded away from zero.
+    ncps_ltc_wiring: full       # full | ncp (sparse AutoNCP)
+    ncps_ltc_hidden_dim: 128    # small by default: memory ~ B * units^2 * T * ode_unfolds
+    ncps_ltc_ode_unfolds: 6     # library default, not a tuned value; cost is linear in it
+    ncps_ltc_motor_neurons: null   # ncp wiring only; defaults to hidden_dim // 4
+    ncps_ltc_use_checkpoint: false # recompute segments in backward to cut activation memory
+    ncps_ltc_checkpoint_every: 1   # steps per checkpointed segment; higher = less saving, less recompute
+
+    # Reference `ncps` CfC (gen_strategy=ncps_cfc)
+    ncps_cfc_hidden_dim: 512
+    ncps_cfc_mode: default      # default | pure | no_gate (the latter two are cell ablations)
+    ncps_cfc_wiring: full       # full | ncp; ncps forbids the backbone args under 'ncp'
+    ncps_cfc_motor_neurons: null   # ncp wiring only; defaults to hidden_dim // 4
+    ncps_cfc_backbone_units: null  # null => hidden_dim (NOT ncps' 128, which would bottleneck)
+    ncps_cfc_backbone_layers: 1
+    ncps_cfc_backbone_dropout: 0.0
 
     # Sample time positions in non-integer locations
     use_fractional_t: true
@@ -56,3 +88,4 @@ loss_kwargs:
   # Apply the same augmentation to all the frames of a video
   # In our early experiments, the quality dropped a lot when disabling it
   video_consistent_aug: true
+

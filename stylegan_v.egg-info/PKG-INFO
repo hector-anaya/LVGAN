@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: stylegan_v
+Version: 0.1.0
+Summary: Official implementation of StyleGAN-V: A Continuous Video Generator with the Price, Image Quality and Perks of StyleGAN2
+Dynamic: summary

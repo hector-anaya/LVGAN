@@ -1,0 +1,43 @@
+{
+  "gen_strategy": "conv",
+  "network_source": "constructed from experiments/ffs_256_unstable_stylegan-v_random3_max32_ltc_experiment_ffs_2-3fecd69/experiment_config.yaml",
+  "motion_net_calls_per_clip": 1,
+  "video_len": 128,
+  "resolution": 256,
+  "clips_batch_size": 1,
+  "frames_per_forward": 128,
+  "chunked": false,
+  "warmup_clips": 5,
+  "timed_clips": 25,
+  "sec_per_clip_mean": 0.19791488439776003,
+  "sec_per_clip_std": 0.001403890804936594,
+  "sec_per_clip_min": 0.1943131989974063,
+  "sec_per_clip_max": 0.20014198299031705,
+  "peak_gpu_mem_GiB": 5.667667865753174,
+  "params": {
+    "generator_total": 32105941,
+    "generator_mapping": 525312,
+    "motion": {
+      "time_encoder": 524288,
+      "conv": 5768192,
+      "_motion_encoder_total": 6292480,
+      "_strategy_subnetwork": 5768192
+    },
+    "generator_synthesis_backbone": 25288149,
+    "discriminator_total": 25333568
+  },
+  "env": {
+    "gpu_name": "NVIDIA A100-PCIE-40GB",
+    "gpu_capability": "8.0",
+    "gpu_total_mem_GiB": 39.49,
+    "gpu_free_mem_GiB_at_start": null,
+    "torch": "1.9.0+cu111",
+    "cuda": "11.1",
+    "fused_cuda_plugins": {
+      "bias_act": true,
+      "upfirdn2d": true
+    },
+    "precision": "StyleGAN2 native mixed precision (fp16 in top 4 synthesis blocks, fp32 elsewhere); no torch.cuda.amp",
+    "torch_amp_autocast": false
+  }
+}
