@@ -1,26 +1,27 @@
 {
-  "gen_strategy": "ltc",
-  "network_source": "constructed from experiments/sky_timelapse_256_stylegan-v_random3_max32_ltc_experiment_sky_2-3fecd69/experiment_config.yaml",
+  "gen_strategy": "ncps_ltc",
+  "network_source": "constructed from experiments/ffs_256_unstable_stylegan-v_random3_max32_abl_ncps_ltc_1-3fecd69/experiment_config.yaml",
+  "motion_net_calls_per_clip": 1,
   "video_len": 128,
   "resolution": 256,
   "clips_batch_size": 1,
-  "frames_per_forward": 8,
-  "chunked": true,
+  "frames_per_forward": 128,
+  "chunked": false,
   "warmup_clips": 5,
   "timed_clips": 25,
-  "sec_per_clip_mean": 0.815163868481759,
-  "sec_per_clip_std": 0.03249194097518509,
-  "sec_per_clip_min": 0.7697298290004255,
-  "sec_per_clip_max": 0.8737984019971918,
-  "peak_gpu_mem_GiB": 0.5404667854309082,
+  "sec_per_clip_mean": 0.4373507369309664,
+  "sec_per_clip_std": 0.00920635023906963,
+  "sec_per_clip_min": 0.4255348229780793,
+  "sec_per_clip_max": 0.44876213697716594,
+  "peak_gpu_mem_GiB": 5.645966529846191,
   "params": {
-    "generator_total": 27651029,
+    "generator_total": 26815061,
     "generator_mapping": 525312,
     "motion": {
       "time_encoder": 524288,
-      "ltc": 1313280,
-      "_motion_encoder_total": 1837568,
-      "_strategy_subnetwork": 1313280
+      "ncps_ltc": 477312,
+      "_motion_encoder_total": 1001600,
+      "_strategy_subnetwork": 477312
     },
     "generator_synthesis_backbone": 25288149,
     "discriminator_total": 25333568
@@ -29,6 +30,7 @@
     "gpu_name": "NVIDIA A100-PCIE-40GB",
     "gpu_capability": "8.0",
     "gpu_total_mem_GiB": 39.49,
+    "gpu_free_mem_GiB_at_start": null,
     "torch": "1.9.0+cu111",
     "cuda": "11.1",
     "fused_cuda_plugins": {
