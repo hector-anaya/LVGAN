@@ -1,0 +1,37 @@
+# @package _group_
+
+# LNS-BUAP "Huapáctic".
+# gpu2 partition: ampere[01-05], each gpu:A100:4 (80GB), 96 CPUs, 1TB RAM, 15-day walltime.
+# Submit with: env=huapactic sbatch_args.partition=gpu2
+
+python_bin: ${env.project_path}/env/bin/python
+project_path: ${hydra:runtime.cwd}
+
+# gpu2 nodes report AvailableFeatures=(null), so there is no feature to pin.
+# cfg_to_args_str drops empty values, so no dangling --constraint is emitted.
+slurm_constraint: ""
+
+# launch.py asserts `dataset.path_for_slurm_job` exists before submitting, so this
+# must point at a real directory holding <dataset.name>.zip.
+datasets_dir: ${env.project_path}/data
+
+# JIT-built CUDA ops (bias_act, upfirdn2d). Deliberately NOT /tmp: compute nodes get a
+# fresh /tmp per job, so every job would pay the ~2min nvcc rebuild. Kept on the shared
+# FS so it is built once. PyTorch takes a file lock here, so concurrent jobs are safe.
+torch_extensions_dir: ${env.project_path}/.torch_extensions
+
+before_train_commands:
+  - 'module purge'
+  - 'module load Anaconda3/2022.05'
+  - 'source "$(conda info --base)/etc/profile.d/conda.sh"'
+  - 'conda activate ${env.project_path}/env'
+  # A100 is sm_80. Pin it so the JIT extension build does not probe the device.
+  - 'export TORCH_CUDA_ARCH_LIST="8.0"'
+  # nvcc (11.8) and the host compiler (gcc 10) both live inside the conda env, so
+  # the build never depends on which CUDA/GCC modules the cluster happens to have.
+  # torch is cu111: cpp_extension requires the nvcc MAJOR version to match (11) and
+  # only warns about the minor difference. CC/CXX come from conda's compiler
+  # activation scripts, run by the `conda activate` above.
+  - 'export CUDA_HOME="$CONDA_PREFIX"'
+  - 'export PATH="$CUDA_HOME/bin:$PATH"'
+  - 'echo "[huapactic] node=$(hostname) allocation:"; nvidia-smi -L'

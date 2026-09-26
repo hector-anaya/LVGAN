@@ -18,9 +18,16 @@ slurm_log_dir: ${project_release_dir}
 use_qos: false
 sbatch_args:
   constraint: ${env.slurm_constraint}
+  # Declared here (rather than added on the CLI) because launch.py calls
+  # OmegaConf.set_struct(cfg, True), which rejects keys absent from the config.
+  # Empty values are dropped by cfg_to_args_str, so this is inert unless set.
+  # Huapáctic: sbatch_args.partition=gpu2
+  partition: ""
   time: "1-0"
   gres: gpu:${num_gpus}
-  cpus-per-task: 5
+  # NOTE: --cpus-per-task and --cpus-per-gpu are mutually exclusive in SLURM >= 20.11
+  # (sbatch exits with a fatal error). Only one of the two may be set.
+  # cpus-per-task: 5
   mem:
     _target_: src.infra.utils.num_gpus_to_mem
     num_gpus: ${num_gpus}

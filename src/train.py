@@ -270,6 +270,18 @@ def process_hyperparams(cfg: DictConfig):
         desc += f'-target{c.target:g}'
         args.ada_target = c.target
 
+    # ADA controller safety. Upstream StyleGAN2-ADA clamps p from below only, so on a dataset
+    # where r_t never returns to `target` (Taichi-HD) the controller raises p without bound and
+    # the augmentation pipe saturates. `ada_p_max` bounds p to the unit interval it is defined on;
+    # set it to null to restore the unbounded upstream behaviour.
+    args.ada_p_max = c.get('ada_p_max', 1.0)
+    if args.ada_p_max is not None:
+        assert isinstance(args.ada_p_max, (int, float))
+        if not 0 < args.ada_p_max <= 1:
+            raise UserError('--ada_p_max must be in (0, 1], or null to disable the clamp')
+    args.ada_p_warn = c.get('ada_p_warn', 0.9)
+    args.ada_p_warn_kimg = c.get('ada_p_warn_kimg', 500)
+
     assert c.augpipe is None or c.augpipe in augpipe_specs
     if not c.augpipe is None:
         assert c.aug != 'noaug', '--augpipe cannot be specified with --aug=noaug'
@@ -312,9 +324,20 @@ def process_hyperparams(cfg: DictConfig):
         desc += '-resumecustom'
         args.resume_pkl = c.resume # custom path or url
 
+    # NOTE: upstream normalizes an unspecified `resume` to 'noresume' *before* this check, so it
+    # applies these two transfer-learning overrides only when actually fine-tuning from a
+    # pretrained pkl. Here `c.resume is None` (the default, i.e. a from-scratch run) also lands in
+    # this branch, so every run gets them. Left as-is so the published runs stay reproducible;
+    # `training.ada_kimg` below overrides it explicitly when needed.
     if not c.resume in {'noresume', 'latest'}:
         args.ada_kimg = 100 # make ADA react faster at the beginning
         args.ema_rampup = None # disable EMA rampup
+
+    if c.get('ada_kimg', None) is not None:
+        assert isinstance(c.ada_kimg, (int, float))
+        if not c.ada_kimg > 0:
+            raise UserError('--ada_kimg must be positive')
+        args.ada_kimg = c.ada_kimg
 
     if c.freezed is not None:
         assert isinstance(c.freezed, int)

@@ -29,6 +29,63 @@ import src.legacy
 from src.metrics import metric_main
 from src.training.layers import sample_frames
 from src.training.logging import generate_videos, save_video_frames_as_mp4
+# Safe to import even when the `ncps` package is absent: the wrapper classes are always
+# defined (only their ncps-backed cores are soft-imported), so `isinstance` still works.
+from src.training.motion import NCPSLiquidMotionNetwork, NCPSClosedFormMotionNetwork
+
+#----------------------------------------------------------------------------
+
+def construct_optimizer_params(module, lr: float):
+    """
+    Builds the `params` argument for a phase optimizer, giving the `ncps`-backed motion
+    cores their own learning rate.
+
+    Every `FullyConnectedLayer`/`EqLRConv1d` in this codebase uses equalized learning
+    rates: the raw parameter is stored `1 / lr_multiplier` larger and scaled back down by
+    `lr_multiplier / sqrt(fan_in)` in the forward pass. Because Adam's step size is
+    invariant to gradient scale, an optimizer step of size `lr` moves an equalized
+    weight's *effective* value by ~`lr * lr_multiplier / sqrt(fan_in)`, while it moves a
+    plain `nn.Parameter` by ~`lr`. The `ncps` LTC/CfC cores are plain `nn.Parameter`s, so
+    left alone the `ncps_ltc` / `ncps_cfc` arms train orders of magnitude faster than the
+    hand-rolled `ltc` / `cfc` arms -- and any FVD difference between them would measure
+    the learning rate rather than the recurrent cell. We therefore collect those cores
+    into their own param group at `lr * lr_multiplier`.
+
+    NOTE: this makes the effective learning rates *comparable, but not identical*. Two
+    differences remain: (1) equalized LR also rescales the initialisation
+    (`randn / lr_multiplier`), which the ncps parameters do not get; and (2) the residual
+    `1 / sqrt(fan_in)` factor above is not corrected for. This closes the ~100x gap; it
+    does not make the arms exactly equivalent.
+    """
+    # Pre-existing hook, used by the MoCoGAN discriminator to slow down its video branch.
+    if hasattr(module, 'params_with_lr'):
+        return module.params_with_lr(lr)
+
+    # Group by lr_multiplier so several ncps modules with different multipliers stay
+    # correct; in practice the generator holds exactly one motion network.
+    recurrent_ids = set()
+    params_per_multiplier = dict()
+    for m in module.modules():
+        if isinstance(m, (NCPSLiquidMotionNetwork, NCPSClosedFormMotionNetwork)):
+            # Default matches the multiplier hardcoded in MotionMappingNetwork, for
+            # checkpoints pickled before `lr_multiplier` was recorded on the module.
+            lr_multiplier = getattr(m, 'lr_multiplier', 0.01)
+            for p in m.recurrent_parameters():
+                if id(p) not in recurrent_ids:
+                    recurrent_ids.add(id(p))
+                    params_per_multiplier.setdefault(lr_multiplier, []).append(p)
+
+    if len(recurrent_ids) == 0:
+        return module.parameters() # No ncps cores => unchanged behaviour.
+
+    param_groups = [{'params': [p for p in module.parameters() if id(p) not in recurrent_ids]}]
+    for lr_multiplier, params in sorted(params_per_multiplier.items()):
+        param_groups.append({'params': params, 'lr': lr * lr_multiplier})
+
+    # The groups must partition the module's parameters: no overlap, no omissions.
+    assert sum(len(g['params']) for g in param_groups) == len(list(module.parameters()))
+
+    return param_groups
 
 #----------------------------------------------------------------------------
 
@@ -119,6 +176,9 @@ def training_loop(
     ada_target              = None,     # ADA target value. None = fixed p.
     ada_interval            = 4,        # How often to perform ADA adjustment?
     ada_kimg                = 500,      # ADA adjustment speed, measured in how many kimg it takes for p to increase/decrease by one unit.
+    ada_p_max               = 1.0,      # Upper clamp on the ADA probability. None = unbounded (the upstream StyleGAN2-ADA behaviour).
+    ada_p_warn              = 0.9,      # Warn when p stays above this value for `ada_p_warn_kimg`. None = never warn.
+    ada_p_warn_kimg         = 500,      # For how long (in kimg) p must stay above `ada_p_warn` before we warn.
     total_kimg              = 25000,    # Total length of the training, measured in thousands of real images.
     kimg_per_tick           = 5,        # Progress snapshot interval.
     image_snapshot_ticks    = 50,       # How often to save image snapshots? None = disable.
@@ -181,6 +241,7 @@ def training_loop(
     cur_tick = 0 if not resume_whole_state else resume_data['stats']['cur_tick']
     batch_idx = 0 if not resume_whole_state else resume_data['stats']['batch_idx']
     tick_start_nimg = cur_nimg
+    ada_p_high_nimg = 0    # For how long p has been sitting above `ada_p_warn` without dropping back.
 
     # Print network summary tables.
     if rank == 0 and not resume_whole_state:
@@ -238,7 +299,7 @@ def training_loop(
     phases = []
     for name, module, opt_kwargs, reg_interval in [('G', G, G_opt_kwargs, G_reg_interval), ('D', D, D_opt_kwargs, D_reg_interval)]:
         if reg_interval is None:
-            params = module.params_with_lr(opt_kwargs.lr) if hasattr(module, 'params_with_lr') else module.parameters()
+            params = construct_optimizer_params(module, opt_kwargs.lr)
             opt = dnnlib.util.construct_class_by_name(params=params, **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
         else: # Lazy regularization.
@@ -246,7 +307,9 @@ def training_loop(
             opt_kwargs = dnnlib.EasyDict(opt_kwargs)
             opt_kwargs.lr = opt_kwargs.lr * mb_ratio
             opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
-            params = module.params_with_lr(opt_kwargs.lr) if hasattr(module, 'params_with_lr') else module.parameters()
+            # Built from the already-rescaled `opt_kwargs.lr`, so lazy regularization's LR
+            # adjustment applies to both groups; betas/eps stay optimizer-wide defaults.
+            params = construct_optimizer_params(module, opt_kwargs.lr)
             opt = dnnlib.util.construct_class_by_name(params=params, **opt_kwargs) # subclass of torch.optim.Optimizer
             phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
             phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
@@ -407,7 +470,14 @@ def training_loop(
         if (ada_stats is not None) and (batch_idx % ada_interval == 0):
             ada_stats.update()
             adjust = np.sign(ada_stats['Loss/signs/real'] - ada_target) * (batch_size * ada_interval) / (ada_kimg * 1000)
-            augment_pipe.p.copy_((augment_pipe.p + adjust).max(misc.constant(0, device=device)))
+            new_p = (augment_pipe.p + adjust).max(misc.constant(0, device=device))
+            # Upstream StyleGAN2-ADA clamps p from below only, so on a dataset where D never
+            # stops overfitting (r_t pinned above ada_target) the controller raises p without
+            # bound. Past p = 1 every augmentation in the pipe fires with certainty and D stops
+            # seeing the data distribution at all. Clamp p to the unit interval it is defined on.
+            if ada_p_max is not None:
+                new_p = new_p.min(misc.constant(ada_p_max, device=device))
+            augment_pipe.p.copy_(new_p)
 
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)
@@ -426,11 +496,31 @@ def training_loop(
         fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
         fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
         torch.cuda.reset_peak_memory_stats()
-        fields += [f"augment {training_stats.report0('Progress/augment', float(augment_pipe.p.cpu()) if augment_pipe is not None else 0):.3f}"]
+        cur_p = float(augment_pipe.p.cpu()) if augment_pipe is not None else 0
+        fields += [f"augment {training_stats.report0('Progress/augment', cur_p):.3f}"]
         training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / (60 * 60))
         training_stats.report0('Timing/total_days', (tick_end_time - start_time) / (24 * 60 * 60))
         if rank == 0:
             print(' '.join(fields))
+
+        # Warn when the ADA controller has been pinned near the top of its range for a
+        # sustained stretch. That means r_t is stuck above ada_target and augmentation can no
+        # longer compensate for D overfitting: p is saturated and the run is likely degrading.
+        if (ada_stats is not None) and (ada_p_warn is not None):
+            if cur_p > ada_p_warn:
+                ada_p_high_nimg += cur_nimg - tick_start_nimg
+            else:
+                ada_p_high_nimg = 0
+            if ada_p_high_nimg >= ada_p_warn_kimg * 1000:
+                if rank == 0:
+                    print(
+                        f'WARNING: ADA probability p = {cur_p:.3f} has stayed above {ada_p_warn:g} for '
+                        f'{ada_p_high_nimg / 1e3:.0f} kimg, with Loss/signs/real = '
+                        f"{ada_stats['Loss/signs/real']:.3f} vs. ada_target = {ada_target:g}. "
+                        f'The discriminator is overfitting faster than augmentation can compensate; '
+                        f'expect FID/FVD to degrade from here. Consider a lower training.target, '
+                        f'a larger/augmented training split, or stronger R1.')
+                ada_p_high_nimg = 0 # Re-arm, so the warning repeats while p stays saturated.
 
         # Check for abort.
         if (not done) and (abort_fn is not None) and abort_fn():

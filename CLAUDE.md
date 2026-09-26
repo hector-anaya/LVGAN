@@ -162,26 +162,50 @@ Packed as `.zip` by default (faster cluster I/O). Train from directory by removi
 
 ### Motion Generation Strategy (`model.generator.motion.gen_strategy`)
 
-Four options, all implemented in [src/training/motion.py](src/training/motion.py):
+Six options, all implemented in [src/training/motion.py](src/training/motion.py). The
+last four form a controlled ablation whose only intended variable is the recurrent
+core, so they share equalized-LR treatment (see *Learning-rate parity* below):
 
 | Strategy | Description |
 |---|---|
 | `conv` (default) | Two stacked `EqLRConv1d` layers, `padding=0`. Fast and stable but only sees a fixed local window (`kernel_size`). Needs `num_additional_codes = (kernel_size-1)*2` warmup inputs. |
 | `autoregressive` | LSTM. Can diverge for large `t`. |
-| `ltc` | **Liquid Time-Constant network.** Recurrent cell whose time constant τ adapts to the input, solving `dx/dt = -x/τ(x,u) + f(x,u)` with `ode_unfolds` Euler sub-steps. Hidden state persists across the full trajectory, eliminating window-boundary artefacts and naturally producing smooth motion. |
-| `cfc` | **Closed-form Continuous-time network** (Hasani et al., Nature MI 2022). Same continuous-time inductive bias as LTC, but each step is a single analytic time-gated update — `x(t+Δt) = σ(-τ·Δt)⊙g + (1-σ(-τ·Δt))⊙h` — with no Euler `ode_unfolds` loop, so it is faster while keeping smooth, coherent motion. |
+| `exp_cf` | **Exponential closed-form cell** (`ExpClosedFormCell`). Input-dependent time constants with an exponential gate: `x(t+Δt) = x·exp(-Δt/τ) + f·(1-exp(-Δt/τ))`. Inspired by LTC (Hasani 2021) and adopting CfC's closed-form strategy (Hasani 2022), but identical to neither — it is **not** a solver-based conductance model, and `ode_unfolds` here just subdivides Δt into successive closed-form steps. `ltc` remains a deprecated alias. |
+| `cfc` | **Closed-form Continuous-time network** (Hasani et al., Nature MI 2022). Same idea as `exp_cf` but the gate is a sigmoid: `x(t+Δt) = σ(-τ·Δt)⊙g + (1-σ(-τ·Δt))⊙h`. A single closed-form update per step, avoiding the inner ODE loop and its accumulated discretisation error — not an exact solution of the liquid ODE. |
+| `ncps_ltc` | Reference LTC from the `ncps` library — the genuine solver-based conductance model, semi-implicit Euler. **Must stay fp32**: its update divides by `cm/Δt + gleak + w_act`, which is not bounded away from zero. Memory scales as `B · units² · T · ode_unfolds`; set `ncps_ltc_use_checkpoint=true` to trade compute for it. |
+| `ncps_cfc` | Reference CfC from the `ncps` library. Supports `mode` (`default` / `pure` / `no_gate`) and, unlike `ncps_ltc`, a per-sample `timespans` tensor, so non-unit Δt works. |
 
-To train with LTC:
+To train with the exponential closed-form cell:
 
 ```bash
 python src/infra/launch.py hydra.run.dir=. exp_suffix=my_exp env=local dataset=ffs \
   dataset.resolution=256 num_gpus=4 \
-  model.generator.motion.gen_strategy=ltc \
+  model.generator.motion.gen_strategy=exp_cf \
   model.generator.motion.ltc_hidden_dim=512 \
   model.generator.motion.ltc_ode_unfolds=6
 ```
 
-`ltc_ode_unfolds` controls how many Euler sub-steps are used per `motion_z_distance` interval; higher values are more accurate but slower. `ltc_hidden_dim` defaults to `motion.z_dim` if omitted.
+`ltc_ode_unfolds` controls how many closed-form sub-steps are taken per
+`motion_z_distance` interval; higher values are smoother but slower. `ltc_hidden_dim`
+defaults to `motion.z_dim` if omitted. The config keys keep the historical `ltc_`
+prefix (as does the `self.ltc` submodule attribute) so existing runs still resume.
+
+### Learning-rate parity across the ablation
+
+Every `FullyConnectedLayer`/`EqLRConv1d` here uses equalized LR: the raw parameter is
+stored `1/lr_multiplier` larger and scaled back by `lr_multiplier/sqrt(fan_in)` in the
+forward pass. The `ncps` cores are plain `nn.Parameter`s. Because Adam's step is
+invariant to gradient scale, the ncps arms would otherwise train orders of magnitude
+faster, and any FVD gap would measure the learning rate rather than the cell.
+`construct_optimizer_params` in
+[src/training/training_loop.py](src/training/training_loop.py) therefore puts the ncps
+cores in their own param group at `lr * lr_multiplier`. This makes effective LRs
+comparable, **not** identical — equalized LR also rescales the init, and a
+`1/sqrt(fan_in)` residual remains.
+
+The related `log_tau_0` asymmetry inside `ExpClosedFormCell`/`CfCCell` (a raw parameter
+at full LR shadowing an equalized bias) is left in place by default but can be ablated
+with `ltc_learn_tau_bias=false` / `cfc_learn_tau_bias=false`.
 
 To train with CfC:
 
@@ -192,4 +216,28 @@ python src/infra/launch.py hydra.run.dir=. exp_suffix=my_exp env=local dataset=f
   model.generator.motion.cfc_hidden_dim=512
 ```
 
-CfC needs no `ode_unfolds` (it is closed-form in Δt). `cfc_hidden_dim` defaults to `motion.z_dim` if omitted.
+CfC needs no `ode_unfolds` — each step is a single closed-form update rather than an
+inner ODE loop. `cfc_hidden_dim` defaults to `motion.z_dim` if omitted.
+
+To train with the reference `ncps` implementations (requires `pip install ncps`;
+verified against **ncps 0.0.2**):
+
+```bash
+# ncps CfC — backbone defaults to hidden_dim, not ncps' 128, to keep capacity comparable
+python src/infra/launch.py hydra.run.dir=. exp_suffix=my_exp env=local dataset=ffs \
+  dataset.resolution=256 num_gpus=4 \
+  model.generator.motion.gen_strategy=ncps_cfc \
+  model.generator.motion.ncps_cfc_hidden_dim=512
+
+# ncps LTC — fp32 only; checkpointing cuts activation memory
+python src/infra/launch.py hydra.run.dir=. exp_suffix=my_exp env=local dataset=ffs \
+  dataset.resolution=256 num_gpus=4 \
+  model.generator.motion.gen_strategy=ncps_ltc \
+  model.generator.motion.ncps_ltc_hidden_dim=128 \
+  model.generator.motion.ncps_ltc_use_checkpoint=true \
+  model.generator.motion.ncps_ltc_checkpoint_every=4
+```
+
+Note that `ncps_*_wiring=ncp` (sparse `AutoNCP`) reduces *parameter* count but not
+activation memory — ncps stores the wiring as a dense adjacency mask, so masked
+synapses are zeros rather than absent. Use `ncps_ltc_use_checkpoint` for memory.

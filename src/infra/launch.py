@@ -47,6 +47,16 @@ def main(cfg: DictConfig):
             print("We are going to resume the training and the experiment already exists. " \
                 "That's why the provided config/training_cmd are discarded and the project dir is not created.")
 
+        # `train.py` reads the *saved* config, so `training.resume=latest` must be present in it.
+        # Otherwise it treats the run as a fresh one and crashes on `os.makedirs(run_dir, exist_ok=False)`.
+        saved_cfg = OmegaConf.load(cfg_save_path)
+        if saved_cfg.training.resume != "latest":
+            saved_cfg.training.resume = "latest"
+            with open(cfg_save_path, 'w') as f:
+                OmegaConf.save(config=saved_cfg, f=f)
+            if not quiet:
+                print(f'Patched `training.resume=latest` into {cfg_save_path}')
+
     if is_running_from_scratch and not cfg.print_only:
         create_project_dir(
             cfg.project_release_dir,

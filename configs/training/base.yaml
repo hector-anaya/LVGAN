@@ -24,6 +24,10 @@ subset: ~ # Train with only N images [default: all]
 p: ~ # Augmentation probability for --aug=fixed
 target: 0.6 # ADA target value for --aug=ada
 augpipe: bgc # Augmentation pipeline [default: bgc]
+ada_p_max: 1.0 # Upper clamp on the ADA probability p. Set to `null` for the unbounded upstream behaviour.
+ada_p_warn: 0.9 # Warn when p stays above this for `ada_p_warn_kimg`. `null` disables the warning.
+ada_p_warn_kimg: 500 # How long p must stay above `ada_p_warn` before warning
+ada_kimg: ~ # ADA adjustment speed (kimg for p to move one unit). `null` keeps the built-in 100.
 
 # Transfer learning.
 freezed: 0 # Freeze-D [default: 0 layers]

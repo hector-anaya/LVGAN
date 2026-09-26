@@ -1,7 +1,7 @@
 # Experiment Report — Continuous-Time Motion Generators for StyleGAN-V
 
-**Status:** protocol / pre-registration (no results yet)
-**Date:** 2026-08-11
+**Status:** §5.4–5.6 filled from 18 completed runs (2026-09-09). §1–5.3 remain the protocol as written.
+**Date:** 2026-08-11, results appended 2026-09-09
 **Codebase:** `stylegan-v` @ branch `master`
 **Owner:** hector.96.uno@gmail.com
 
@@ -233,24 +233,122 @@ should not.
 6. **Cost** — record from the training log: s/kimg, peak VRAM, total wall clock, and generator
    parameter count per strategy.
 
-### 5.4 Results table (to fill)
+### 5.4 Results (filled 2026-09-09 from `D:\PHD\Experiments\Test_server_2nd`)
 
-Report `mean ± std` over seeds 0/1/2. Lower is better for all four metrics.
+18 completed runs, all at 2 GPUs / `batch_size=64` / `allow_tf32=false`. Values are the **best
+checkpoint per metric** over each run's 20–27 snapshots; `±` is the sample standard deviation over
+runs, reported only where n ≥ 3. Lower is better for all four metrics.
 
-**FaceForensics 256² (`min_period_len=16`)**
+#### The noise floor — read this before any table below
 
-| Strategy | FVD16 ↓ | FVD128 ↓ | FVD128-sub8 ↓ | FID50k ↓ | s/kimg | Params |
-|---|---|---|---|---|---|---|
-| `conv` (baseline) | | | | | | |
-| `ltc` | | | | | | |
-| `cfc` | | | | | | |
+`ltc_experiment`, `ltc_experiment_2` and `my_experiment_name` have **identical `experiment_config.yaml`
+files including `seed: 0`**; only `exp_suffix` differs. Their results:
 
-**SkyTimelapse 256² (`min_period_len=256`)** — same columns
-**UCF101 256² (`min_period_len=32`)** — same columns
-**TaiChi 128² (`min_period_len=32`)** — same columns
+| Run (identical config, identical seed) | FVD16 | FVD128 | FVD128-sub8 | FID50k |
+|---|---|---|---|---|
+| `ltc_experiment` | 45.21 | 68.40 | 75.84 | 13.59 |
+| `ltc_experiment_2` | 47.87 | 73.05 | 81.08 | 15.12 |
+| `my_experiment_name` | 51.80 | 94.84 | 82.92 | 15.81 |
+| **spread** | **6.59** | **26.44** | **7.09** | **2.22** |
 
-Add a derived column **ΔFVD128 − ΔFVD16** (improvement over baseline at long vs short horizon); that
-number, not raw FVD, is the direct test of H2.
+`training.seed` does not make StyleGAN2 deterministic (cuDNN autotune + non-deterministic DDP
+reductions). **Any difference smaller than ~6.6 FVD16 / ~26 FVD128 is not a result.**
+
+#### FaceForensics 256² (`min_period_len=16`)
+
+| Strategy | n | FVD16 ↓ | FVD128 ↓ | FVD128-sub8 ↓ | FID50k ↓ |
+|---|---|---|---|---|---|
+| `conv` (baseline) ⚠ | 1 | 52.21 | 77.38 | 89.69 | 15.86 |
+| `cfc` | 1 | 46.07 | 81.37 | 91.94 | 14.25 |
+| `exp_cf` (`ltc`) | 5 | 48.85 ± 2.84 | 80.10 ± 12.69 | **78.14 ± 4.10** | 14.38 |
+
+⚠ The `conv` run stopped at **19 699 / 25 000 kimg** and archived **no `experiment_config.yaml` and no
+`src/`** — its settings cannot be verified. It must be redone before any of this is publishable.
+
+Per-run `exp_cf`: 45.21 / 47.87 / 51.80 (seed 0 ×3), 47.68 (s1), 51.68 (s2).
+
+**Verdicts against the noise floor:**
+
+- **H1 (short-horizon quality) — NOT SUPPORTED.** The 3.36 FVD16 gap is half the noise floor, versus an
+  n=1 baseline.
+- **H2 on FVD128 — NOT SUPPORTED.** `exp_cf` is 2.72 *worse* than `conv`, with σ = 12.69.
+- **H2 on FVD128-sub8 — MARGINAL BUT CONSISTENT.** All 5 `exp_cf` runs beat `conv` (72.62, 75.84,
+  78.23, 81.08, 82.92 vs 89.69). Smallest margin 6.77 ≈ that metric's own spread (7.09); largest 17.07.
+  **This is the only metric where the ordering holds, and it is the one that spans 1024 frames.** Lead
+  with it.
+
+#### SkyTimelapse 256² (`min_period_len=256`) — no baseline
+
+| Strategy | n | FVD16 ↓ | FVD128 ↓ | FVD128-sub8 ↓ | FID50k ↓ |
+|---|---|---|---|---|---|
+| `conv` (baseline) | **0** | — | — | — | — |
+| `exp_cf` | 3 | 46.66 | 205.94 | 91.81 | 44.26 |
+
+Per-run FVD16: 43.30 / 46.03 / 50.63. Strongest absolute result in the study — and unusable as
+evidence, because there is nothing to compare it to.
+
+#### TaiChi 256² (`min_period_len=16`) — no baseline, and misconfigured
+
+Ran at **256² with `min_period_len=16`**, not the 128² / 32 specified in §4.1. Published TaiChi numbers
+are 128², so these are not comparable to the literature.
+
+| Strategy | n | FVD16 ↓ | FVD128 ↓ | FVD128-sub8 ↓ | FID50k ↓ |
+|---|---|---|---|---|---|
+| `conv` (baseline) | **0** | — | — | — | — |
+| `exp_cf` | 3 | 271.02 | 485.71 | 433.93 | 46.72 |
+| `cfc` | 1 | 280.12 | 486.72 | 503.01 | 51.40 |
+| `ncps_ltc` | 1 | 301.66 | 488.41 | 387.37 | 42.69 |
+
+**All three `exp_cf` runs peak at 6 220–8 299 kimg and then degrade monotonically to 25 000:**
+
+| Seed | peak kimg | FVD16 best → final | FVD128 best → final |
+|---|---|---|---|
+| 0 | 6 220 | 261.53 → 305.32 (+17%) | 516.17 → 661.46 (+28%) |
+| 1 | 8 294 | 291.04 → 372.28 (+28%) | 523.94 → 704.53 (+34%) |
+| 2 | 7 262 | 260.50 → 269.32 (+3%) | 417.03 → 558.02 (+34%) |
+
+ADA `p` climbs monotonically past 0.57 and is still rising at the end (FFS settles at ~0.27) —
+discriminator overfitting. **~2/3 of the TaiChi and UCF101 compute was spent making the numbers worse.**
+
+#### UCF101 256² (`min_period_len=16`) — no baseline
+
+| Strategy | n | FVD16 ↓ | FVD128 ↓ | FVD128-sub8 ↓ | FID50k ↓ |
+|---|---|---|---|---|---|
+| `conv` (baseline) | **0** | — | — | — | — |
+| `exp_cf` | 3 | 1562.30 | 1989.13 | 1622.78 | 48.53 |
+
+Also peaks early (15 552–20 736 kimg) and degrades. `min_period_len=16`, not the 32 in §4.1.
+
+#### The ΔFVD128 − ΔFVD16 column
+
+Cannot be computed for Sky / TaiChi / UCF101 — no baseline exists. On FFS it is **+6.08** on FVD128
+(i.e. the wrong sign for H2) and **−8.19** on FVD128-sub8 (the right sign). Report the sub8 version,
+and report the noise floor next to it.
+
+### 5.5 Reproducibility defect found during this audit
+
+All 18 directories are stamped `-3fecd69`, but that commit **contains no LTC or CfC classes at all** —
+every run was launched from a dirty tree, so the git hash in the directory name does not identify the
+code that ran. The archived `experiments/<dir>/src/` is the only ground truth, and the `conv` baseline
+has none.
+
+Three distinct `motion.py` files exist across the runs (332 / 433 / 571 lines). Diffing them: the
+changes are **purely additive** (CfC added, then the ncps wrappers), so the `exp_cf` and `cfc` cells are
+byte-identical wherever they appear and the runs above *are* mutually comparable. This was luck.
+
+**`training.resume=latest` matches on that git hash**, so a resume can silently load different code than
+the run started with. Commit before the next batch.
+
+### 5.6 The horizon mismatch (highest-value untested change)
+
+The discriminator only ever sees frames `sampling.max_dist=32` apart. `fvd2048_128f_subsample8f` — the
+one metric where the continuous-time cells win — integrates over **1024 frames**. Nothing in the
+training objective penalises inconsistency beyond 32 frames.
+
+`sampling.total_dists` already lists values up to 2048; `max_dist` alone truncates the range. Raising it
+to 128 costs **zero extra compute per step** (the same 3 frames are loaded, just further apart) and is
+the only change that supplies training signal for the metric the claim rests on. **No run in the study
+has tried it.** Run this before another cell comparison.
 
 ---
 
