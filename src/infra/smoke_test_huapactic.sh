@@ -14,7 +14,14 @@ cd "$PROJECT_DIR"
 module purge
 module load Anaconda3/2022.05
 source "$(conda info --base)/etc/profile.d/conda.sh"
+
+# `set -u` must be off across conda activation. The compiler packages install
+# etc/conda/activate.d/activate-binutils_linux-64.sh, which reads $ADDR2LINE (and
+# friends) to stash their prior values before overwriting them. Those are unset in
+# a clean shell, so -u makes activation fatal. Same applies to module commands.
+set +u
 conda activate "$PROJECT_DIR/env"
+set -u
 
 # A100 = sm_80. Pin it so the extension build does not probe the device.
 export TORCH_CUDA_ARCH_LIST="8.0"

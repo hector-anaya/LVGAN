@@ -53,8 +53,17 @@ TORCH_FIND_LINKS="https://download.pytorch.org/whl/torch_stable.html"
 step() { echo; echo "==> $*"; }
 have() { "$PY" -c "import $1" >/dev/null 2>&1; }
 
+# `set -u` must be off across conda activation and module commands. The compiler
+# packages install etc/conda/activate.d/activate-binutils_linux-64.sh, which reads
+# $ADDR2LINE (and friends) to stash their prior values before overwriting them.
+# Those are unset in a clean shell, so -u makes activation fatal.
+conda_on()  { set +u; conda activate "$1"; set -u; }
+conda_off() { set +u; conda deactivate;    set -u; }
+
+set +u
 module purge
 module load Anaconda3/2022.05
+set -u
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
 if [ "${FORCE:-0}" = "1" ] && [ -d "$ENV_DIR" ]; then
@@ -86,7 +95,7 @@ else
     conda create -y -p "$ENV_DIR" "python=$PY_VER" pip
 fi
 
-conda activate "$ENV_DIR"
+conda_on "$ENV_DIR"
 
 # --- 1a. constraints ----------------------------------------------------------
 # numpy is pinned exactly to gpuserver02's version. Enforcing that per-install
@@ -152,8 +161,8 @@ fi
 
 # Re-activate so conda's compiler activation scripts export CC/CXX/CFLAGS with the
 # correct sysroot. Installing the packages alone does not set them in this shell.
-conda deactivate
-conda activate "$ENV_DIR"
+conda_off
+conda_on "$ENV_DIR"
 export CUDA_HOME="$ENV_DIR"
 export PATH="$CUDA_HOME/bin:$PATH"
 step "CC=${CC:-<unset>}"
