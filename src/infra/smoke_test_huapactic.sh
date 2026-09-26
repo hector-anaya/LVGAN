@@ -11,15 +11,14 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
 
+# `set -u` must be off across module commands and conda activation. The compiler
+# packages install etc/conda/{activate,deactivate}.d/*-binutils_linux-64.sh and
+# friends, which read $ADDR2LINE / $CONDA_BACKUP_CXX etc. to save and restore
+# prior values. Those are unset in a clean shell, so -u makes activation fatal.
+set +u
 module purge
 module load Anaconda3/2022.05
 source "$(conda info --base)/etc/profile.d/conda.sh"
-
-# `set -u` must be off across conda activation. The compiler packages install
-# etc/conda/activate.d/activate-binutils_linux-64.sh, which reads $ADDR2LINE (and
-# friends) to stash their prior values before overwriting them. Those are unset in
-# a clean shell, so -u makes activation fatal. Same applies to module commands.
-set +u
 conda activate "$PROJECT_DIR/env"
 set -u
 

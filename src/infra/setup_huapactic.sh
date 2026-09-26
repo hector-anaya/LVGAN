@@ -163,10 +163,28 @@ fi
 # correct sysroot. Installing the packages alone does not set them in this shell.
 conda_off
 conda_on "$ENV_DIR"
+
+# Fallback: don't depend on the activation dance having worked. The compiler
+# binaries from gcc_linux-64 / gxx_linux-64 have deterministic names, so CC/CXX
+# can be set directly. torch's cpp_extension reads these to pick the host
+# compiler for nvcc; if they stay unset it silently uses the system gcc 12.2,
+# which CUDA 11.x rejects.
+if [ -z "${CXX:-}" ]; then
+    CC="$(ls "$ENV_DIR"/bin/*-linux-gnu-gcc 2>/dev/null | head -1 || true)"
+    CXX="$(ls "$ENV_DIR"/bin/*-linux-gnu-g++ 2>/dev/null | head -1 || true)"
+    export CC CXX
+fi
+
 export CUDA_HOME="$ENV_DIR"
 export PATH="$CUDA_HOME/bin:$PATH"
 step "CC=${CC:-<unset>}"
 step "CXX=${CXX:-<unset>}"
+
+if [ -z "${CXX:-}" ] || [ ! -x "${CXX:-/nonexistent}" ]; then
+    echo "ERROR: no conda host compiler found in $ENV_DIR/bin." >&2
+    echo "       nvcc would fall back to system gcc $(gcc -dumpversion 2>/dev/null), which CUDA $CUDA_VER rejects." >&2
+    exit 1
+fi
 
 # --- 3. torch -----------------------------------------------------------------
 # The +cu111 local-version wheels are only on the legacy torch_stable index, so
