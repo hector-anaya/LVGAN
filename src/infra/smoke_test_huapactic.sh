@@ -6,21 +6,18 @@
 #   srun -p gpu2 --gres=gpu:1 --cpus-per-gpu=8 --time=00:20:00 --pty \
 #        bash src/infra/smoke_test_huapactic.sh
 
-set -euo pipefail
+# `-eo pipefail` without `-u`: conda's compiler activate.d/deactivate.d scripts
+# read unset variables ($ADDR2LINE, $CONDA_BACKUP_CXX) by design, and the conda
+# shell function sources them on activate, deactivate AND after any install.
+set -eo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
 
-# `set -u` must be off across module commands and conda activation. The compiler
-# packages install etc/conda/{activate,deactivate}.d/*-binutils_linux-64.sh and
-# friends, which read $ADDR2LINE / $CONDA_BACKUP_CXX etc. to save and restore
-# prior values. Those are unset in a clean shell, so -u makes activation fatal.
-set +u
 module purge
 module load Anaconda3/2022.05
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$PROJECT_DIR/env"
-set -u
 
 # A100 = sm_80. Pin it so the extension build does not probe the device.
 export TORCH_CUDA_ARCH_LIST="8.0"

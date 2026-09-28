@@ -33,7 +33,15 @@
 #  - Driver is 530.30.02 (CUDA 12.1). It runs cu111 binaries fine: the driver is
 #    backward compatible, and cu111 already emits sm_80 for the A100.
 
-set -euo pipefail
+# NOTE: deliberately `-eo pipefail` WITHOUT `-u`.
+# conda's compiler packages ship etc/conda/{activate,deactivate}.d scripts that
+# read $ADDR2LINE, $CONDA_BACKUP_CXX and friends to save/restore prior values.
+# Those are unset in a clean shell, so `-u` turns them fatal. It is not enough to
+# guard `conda activate`: the conda shell function calls __conda_reactivate()
+# after every install/update/remove into the active prefix, which sources those
+# same scripts, so `conda install` trips it too. Errors still abort the script
+# via -e; only the unset-variable check is off.
+set -eo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ENV_DIR="$PROJECT_DIR/env"
@@ -53,17 +61,11 @@ TORCH_FIND_LINKS="https://download.pytorch.org/whl/torch_stable.html"
 step() { echo; echo "==> $*"; }
 have() { "$PY" -c "import $1" >/dev/null 2>&1; }
 
-# `set -u` must be off across conda activation and module commands. The compiler
-# packages install etc/conda/activate.d/activate-binutils_linux-64.sh, which reads
-# $ADDR2LINE (and friends) to stash their prior values before overwriting them.
-# Those are unset in a clean shell, so -u makes activation fatal.
-conda_on()  { set +u; conda activate "$1"; set -u; }
-conda_off() { set +u; conda deactivate;    set -u; }
+conda_on()  { conda activate "$1"; }
+conda_off() { conda deactivate; }
 
-set +u
 module purge
 module load Anaconda3/2022.05
-set -u
 source "$(conda info --base)/etc/profile.d/conda.sh"
 
 if [ "${FORCE:-0}" = "1" ] && [ -d "$ENV_DIR" ]; then
