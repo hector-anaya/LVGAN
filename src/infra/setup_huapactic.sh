@@ -148,17 +148,36 @@ else
     step "pkg_resources available — skipping setuptools pin"
 fi
 
-# --- 2. compiler + nvcc -------------------------------------------------------
-# Both come from conda so the build never depends on cluster module names.
-if [ -x "$ENV_DIR/bin/nvcc" ] && [ -n "$(ls "$ENV_DIR"/bin/*-g++ 2>/dev/null || true)" ]; then
-    step "nvcc + conda compiler present — skipping"
+# --- 2a. host compiler --------------------------------------------------------
+# From conda so the build never depends on which GCC modules the cluster has.
+if [ -n "$(ls "$ENV_DIR"/bin/*-linux-gnu-g++ 2>/dev/null || true)" ]; then
+    step "conda compiler present — skipping"
 else
     step "Installing gcc/g++ $GCC_VER (CUDA 11.x rejects gcc > 11; system default here is 12.2)"
     conda install -y -c conda-forge \
         "gcc_linux-64=$GCC_VER" "gxx_linux-64=$GCC_VER" "sysroot_linux-64=2.17"
+fi
 
-    step "Installing nvcc $CUDA_VER + CUDA runtime headers"
-    conda install -y -c nvidia "cuda-nvcc=$CUDA_VER" "cuda-cudart-dev=$CUDA_VER"
+# --- 2b. CUDA headers + nvcc --------------------------------------------------
+# Grepping the ops' own #includes is NOT enough to size this. They pull torch
+# headers that reach further into the toolkit:
+#   bias_act.cu -> c10/util/Half.h -> c10/util/complex.h -> <thrust/complex.h>
+#       ...thrust and cub live in cuda-cccl
+#   *.cpp       -> ATen/cuda/CUDAContext.h -> <cusparse.h>, <cublas_v2.h>
+#       ...those dev headers live in cuda-libraries-dev
+# Still not the full cuda-toolkit metapackage, which additionally drags in
+# nsight, the profilers and docs for ~3.5GB of things no build here touches.
+#
+# thrust/complex.h is the canary: if it is missing the whole set is incomplete,
+# which is how this was caught (nvcc existed, so an nvcc-only check skipped it).
+if [ -x "$ENV_DIR/bin/nvcc" ] && [ -f "$ENV_DIR/include/thrust/complex.h" ] \
+   && [ -f "$ENV_DIR/include/cublas_v2.h" ]; then
+    step "nvcc + CUDA headers present — skipping"
+else
+    step "Installing nvcc $CUDA_VER + CUDA dev headers (cccl: thrust/cub, libraries-dev: cublas/cusparse)"
+    conda install -y -c nvidia \
+        "cuda-nvcc=$CUDA_VER" "cuda-cudart-dev=$CUDA_VER" \
+        "cuda-cccl=$CUDA_VER" "cuda-libraries-dev=$CUDA_VER"
 fi
 
 # Re-activate so conda's compiler activation scripts export CC/CXX/CFLAGS with the

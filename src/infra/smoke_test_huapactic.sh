@@ -46,8 +46,27 @@ echo "== host compiler =="; "${CXX:-g++}" --version | head -1; echo "CXX=${CXX:-
 
 # -u: unbuffered, so progress appears live instead of arriving all at once at the
 # end (or not at all, if the job is killed first).
+# Fail fast and legibly if the CUDA dev headers are incomplete, rather than
+# spending minutes in nvcc to reach the same conclusion.
+for h in include/thrust/complex.h include/cublas_v2.h include/cuda_runtime.h; do
+    if [ ! -f "$CONDA_PREFIX/$h" ]; then
+        echo "ERROR: missing $CONDA_PREFIX/$h" >&2
+        echo "       CUDA dev headers incomplete -- re-run src/infra/setup_huapactic.sh" >&2
+        exit 1
+    fi
+done
+echo "== CUDA headers present =="
+
 python -u - <<'PY'
+import time
+_t = time.time()
+def lap(what):
+    global _t
+    print(f"    [{time.time() - _t:6.1f}s] {what}", flush=True)
+    _t = time.time()
+
 import torch
+lap("import torch")
 print("torch             :", torch.__version__)
 print("torch.version.cuda:", torch.version.cuda)
 print("cuda available    :", torch.cuda.is_available())
@@ -74,10 +93,12 @@ x = torch.randn(4, 8, 16, 16, device="cuda")
 b = torch.randn(8, device="cuda")
 y = bias_act.bias_act(x, b, act="lrelu")
 print("bias_act          :", tuple(y.shape), "OK")
+lap("build+run bias_act")
 
 f = upfirdn2d.setup_filter([1, 3, 3, 1], device="cuda")
 z = upfirdn2d.upsample2d(x, f)
 print("upfirdn2d         :", tuple(z.shape), "OK")
+lap("build+run upfirdn2d")
 
 # conv2d_gradfix must take the custom path, not the F.conv2d fallback -- that is
 # the whole reason this env is pinned to torch 1.9 (see conv2d_gradfix.py:53).
