@@ -24,13 +24,29 @@ export TORCH_CUDA_ARCH_LIST="8.0"
 # nvcc and the host compiler both live in the env (see setup_huapactic.sh).
 export CUDA_HOME="$CONDA_PREFIX"
 export PATH="$CUDA_HOME/bin:$PATH"
-export TORCH_EXTENSIONS_DIR="$PROJECT_DIR/.torch_extensions"
+# Override to a node-local path to rule out NFS, e.g.
+#   TORCH_EXTENSIONS_DIR=/tmp/te_$USER srun ... bash src/infra/smoke_test_huapactic.sh
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$PROJECT_DIR/.torch_extensions}"
+mkdir -p "$TORCH_EXTENSIONS_DIR"
+
+# A job killed mid-build (SLURM time limit, Ctrl-C) leaves the FileBaton lock
+# behind. custom_ops.py:105 and torch's own _jit_compile then call baton.wait(),
+# which loops forever on a lock whose owner is long gone -- the retry hangs
+# instead of rebuilding. Nothing else holds these locks between jobs, so any that
+# exist now are stale by definition.
+STALE=$(find "$TORCH_EXTENSIONS_DIR" -name lock 2>/dev/null | wc -l)
+if [ "$STALE" -gt 0 ]; then
+    echo "== clearing $STALE stale build lock(s) from a killed run =="
+    find "$TORCH_EXTENSIONS_DIR" -name lock -print -delete
+fi
 
 echo "== node =="; hostname; nvidia-smi -L
 echo "== nvcc =="; nvcc --version | tail -2
 echo "== host compiler =="; "${CXX:-g++}" --version | head -1; echo "CXX=${CXX:-<unset, using system g++>}"
 
-python - <<'PY'
+# -u: unbuffered, so progress appears live instead of arriving all at once at the
+# end (or not at all, if the job is killed first).
+python -u - <<'PY'
 import torch
 print("torch             :", torch.__version__)
 print("torch.version.cuda:", torch.version.cuda)
@@ -43,6 +59,14 @@ assert torch.cuda.is_available(), "no CUDA device visible inside the allocation"
 # through PTX (or fails). cu111 does include it; this asserts rather than assumes.
 print("arch list         :", torch.cuda.get_arch_list())
 assert "sm_80" in torch.cuda.get_arch_list(), "wheel has no sm_80 -> wrong torch build for A100"
+
+# custom_ops defaults to verbosity='brief', which passes verbose=False to
+# cpp_extension.load() -- so a slow nvcc build and a deadlock look identical from
+# outside. 'full' streams the ninja command lines.
+from src.torch_utils import custom_ops
+custom_ops.verbosity = 'full'
+print(f"\nTORCH_EXTENSIONS_DIR: {__import__('os').environ.get('TORCH_EXTENSIONS_DIR')}")
+print("building custom CUDA ops (first run on a new cluster takes a few minutes)...\n", flush=True)
 
 # The real test: compiles the two custom CUDA extensions with ninja + nvcc.
 from src.torch_utils.ops import bias_act, upfirdn2d
