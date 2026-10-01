@@ -50,14 +50,14 @@ echo "== node =="; hostname; nvidia-smi -L
 echo "== nvcc =="; nvcc --version | tail -2
 echo "== host compiler =="; "${CXX:-g++}" --version | head -1; echo "CXX=${CXX:-<unset, using system g++>}"
 
-# -u: unbuffered, so progress appears live instead of arriving all at once at the
-# end (or not at all, if the job is killed first).
 # Fail fast and legibly if the CUDA dev headers are incomplete, rather than
 # spending minutes in nvcc to reach the same conclusion.
+# These live under the CUDA module's prefix, NOT $CONDA_PREFIX — conda no longer
+# supplies CUDA at all (see setup_huapactic.sh for why).
 for h in include/thrust/complex.h include/cublas_v2.h include/cuda_runtime.h; do
-    if [ ! -f "$CONDA_PREFIX/$h" ]; then
-        echo "ERROR: missing $CONDA_PREFIX/$h" >&2
-        echo "       CUDA dev headers incomplete -- re-run src/infra/setup_huapactic.sh" >&2
+    if [ ! -f "$CUDA_HOME/$h" ]; then
+        echo "ERROR: missing $CUDA_HOME/$h" >&2
+        echo "       CUDA module looks incomplete -- check 'module list'" >&2
         exit 1
     fi
 done
