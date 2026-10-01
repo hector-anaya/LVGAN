@@ -23,13 +23,19 @@
 #
 # --- Why the toolchain looks like this ----------------------------------------
 #  - No conda on PATH; Anaconda3/2022.05 is provided as a module.
-#  - torch 1.9's cpp_extension._check_cuda_version REQUIRES the nvcc major version
-#    to match torch.version.cuda (11). A minor mismatch is only a warning, so any
-#    CUDA 11.x nvcc works; CUDA 12 would hard-fail. The env therefore pulls an
-#    11.x nvcc from conda rather than the cluster's default CUDA.
-#  - CUDA 11.x rejects host compilers newer than gcc 11, and Huapáctic's default
-#    is gcc 12.2.0. The compiler also comes from conda, so this never depends on
-#    which GCC modules happen to exist.
+#  - CUDA and the host compiler come from the cluster's CUDA/11.1.1-GCC-10.2.0
+#    module, which is an EXACT match for torch 1.9.0+cu111 (11.1, not merely
+#    "some 11.x"), and is EasyBuild-paired with gcc 10.2.0 -- the right host
+#    compiler, since CUDA 11.x rejects anything newer than gcc 11 and Huapáctic's
+#    default is 12.2.0.
+#  - Earlier revisions of this script took CUDA from conda instead. Do not go
+#    back to that. conda's `cuda-libraries-dev=11.8.0` is an old-style
+#    metapackage whose `*_linux-64` dependencies are new-style and track
+#    `cuda-version`, so the env silently ended up with nvcc 11.8 alongside
+#    cudart 13.3 and libcublas 13.6. It also lays headers out as
+#    targets/x86_64-linux/include with libs in lib/ (not lib64/), which is not
+#    where torch's cpp_extension looks -- hence "No CUDA runtime is found".
+#    A module is one coherent toolkit with the layout torch expects.
 #  - Driver is 530.30.02 (CUDA 12.1). It runs cu111 binaries fine: the driver is
 #    backward compatible, and cu111 already emits sm_80 for the A100.
 
@@ -53,8 +59,7 @@ TORCH_VER=1.9.0+cu111
 TV_VER=0.10.0+cu111
 NUMPY_VER=1.22.4
 NCPS_VER=1.0.1
-CUDA_VER=11.8      # nvcc only; major must equal torch's 11
-GCC_VER=10         # CUDA 11.x supports gcc <= 11
+CUDA_MODULE="CUDA/11.1.1-GCC-10.2.0"   # exact match for cu111; pulls gcc 10.2.0
 TORCH_FIND_LINKS="https://download.pytorch.org/whl/torch_stable.html"
 # ------------------------------------------------------------------------------
 
@@ -65,8 +70,20 @@ conda_on()  { conda activate "$1"; }
 conda_off() { conda deactivate; }
 
 module purge
+module load "$CUDA_MODULE"
 module load Anaconda3/2022.05
 source "$(conda info --base)/etc/profile.d/conda.sh"
+
+# EasyBuild exports EBROOTCUDA for the module's install prefix.
+CUDA_HOME="${EBROOTCUDA:-${CUDA_HOME:-}}"
+if [ -z "$CUDA_HOME" ] || [ ! -x "$CUDA_HOME/bin/nvcc" ]; then
+    echo "ERROR: $CUDA_MODULE did not provide a usable CUDA_HOME (got '${CUDA_HOME:-unset}')." >&2
+    echo "       Available: module avail 2>&1 | tr ' ' '\\n' | grep -i '^CUDA/'" >&2
+    exit 1
+fi
+export CUDA_HOME
+export PATH="$CUDA_HOME/bin:$PATH"
+step "CUDA from module: $CUDA_HOME ($("$CUDA_HOME/bin/nvcc" --version | tail -1))"
 
 if [ "${FORCE:-0}" = "1" ] && [ -d "$ENV_DIR" ]; then
     step "FORCE=1 — removing $ENV_DIR"
@@ -148,53 +165,52 @@ else
     step "pkg_resources available — skipping setuptools pin"
 fi
 
-# --- 2a. host compiler --------------------------------------------------------
-# From conda so the build never depends on which GCC modules the cluster has.
-if [ -n "$(ls "$ENV_DIR"/bin/*-linux-gnu-g++ 2>/dev/null || true)" ]; then
-    step "conda compiler present — skipping"
+# --- 2. purge conda's CUDA and compilers --------------------------------------
+# CUDA and gcc now come from $CUDA_MODULE. Any conda copies must go, for two
+# reasons beyond mere redundancy:
+#   1. The conda CUDA set is internally inconsistent (nvcc 11.8 + cudart 13.3 +
+#      libcublas 13.6, all held together by a cuda-version 13.3 metapackage).
+#   2. gcc_linux-64's activate.d scripts EXPORT CC/CXX on every activation, which
+#      would silently override the module's gcc 10.2.0 and point nvcc back at a
+#      compiler it was never paired with.
+# --force-remove because the broken CUDA set's own dependency graph is what got
+# us here; we are deleting it wholesale, not satisfying it.
+CONDA_CUDA_PKGS="$(conda list -p "$ENV_DIR" 2>/dev/null \
+    | awk '$1 ~ /^(cuda|libcublas|libcufft|libcurand|libcusolver|libcusparse|libnvjitlink|gcc_linux|gxx_linux|binutils_linux|sysroot_linux)/ {print $1}' \
+    | tr '\n' ' ')"
+
+if [ -n "$(echo "$CONDA_CUDA_PKGS" | tr -d '[:space:]')" ]; then
+    step "Removing conda CUDA/compiler packages (module provides these):"
+    echo "    $CONDA_CUDA_PKGS"
+    conda remove -y -p "$ENV_DIR" --force-remove $CONDA_CUDA_PKGS || \
+        echo "    (some were already absent — continuing)"
 else
-    step "Installing gcc/g++ $GCC_VER (CUDA 11.x rejects gcc > 11; system default here is 12.2)"
-    conda install -y -c conda-forge \
-        "gcc_linux-64=$GCC_VER" "gxx_linux-64=$GCC_VER" "sysroot_linux-64=2.17"
+    step "no conda CUDA/compiler packages to remove — skipping"
 fi
 
-# --- 2b. CUDA headers + nvcc --------------------------------------------------
-# Grepping the ops' own #includes is NOT enough to size this. They pull torch
-# headers that reach further into the toolkit:
-#   bias_act.cu -> c10/util/Half.h -> c10/util/complex.h -> <thrust/complex.h>
-#       ...thrust and cub live in cuda-cccl
-#   *.cpp       -> ATen/cuda/CUDAContext.h -> <cusparse.h>, <cublas_v2.h>
-#       ...those dev headers live in cuda-libraries-dev
-# Still not the full cuda-toolkit metapackage, which additionally drags in
-# nsight, the profilers and docs for ~3.5GB of things no build here touches.
-#
-# thrust/complex.h is the canary: if it is missing the whole set is incomplete,
-# which is how this was caught (nvcc existed, so an nvcc-only check skipped it).
-if [ -x "$ENV_DIR/bin/nvcc" ] && [ -f "$ENV_DIR/include/thrust/complex.h" ] \
-   && [ -f "$ENV_DIR/include/cublas_v2.h" ]; then
-    step "nvcc + CUDA headers present — skipping"
-else
-    step "Installing nvcc $CUDA_VER + CUDA dev headers (cccl: thrust/cub, libraries-dev: cublas/cusparse)"
-    conda install -y -c nvidia \
-        "cuda-nvcc=$CUDA_VER" "cuda-cudart-dev=$CUDA_VER" \
-        "cuda-cccl=$CUDA_VER" "cuda-libraries-dev=$CUDA_VER"
-fi
+# Host compiler comes from the CUDA module's GCC. Clear anything conda may still
+# be exporting so cpp_extension does not pick up a stale conda toolchain.
+unset CC CXX
+export CC="$(command -v gcc)"
+export CXX="$(command -v g++)"
+step "CC=$CC ($("$CC" -dumpversion))"
+step "CXX=$CXX"
 
-# Re-activate so conda's compiler activation scripts export CC/CXX/CFLAGS with the
-# correct sysroot. Installing the packages alone does not set them in this shell.
-conda_off
-conda_on "$ENV_DIR"
+case "$("$CC" -dumpversion)" in
+    1[2-9]*|[2-9][0-9]*)
+        echo "ERROR: gcc $("$CC" -dumpversion) is too new for CUDA 11.x (needs <= 11)." >&2
+        echo "       $CUDA_MODULE should have supplied gcc 10.2.0 — check 'module list'." >&2
+        exit 1 ;;
+esac
 
-# Fallback: don't depend on the activation dance having worked. The compiler
-# binaries from gcc_linux-64 / gxx_linux-64 have deterministic names, so CC/CXX
-# can be set directly. torch's cpp_extension reads these to pick the host
-# compiler for nvcc; if they stay unset it silently uses the system gcc 12.2,
-# which CUDA 11.x rejects.
-if [ -z "${CXX:-}" ]; then
-    CC="$(ls "$ENV_DIR"/bin/*-linux-gnu-gcc 2>/dev/null | head -1 || true)"
-    CXX="$(ls "$ENV_DIR"/bin/*-linux-gnu-g++ 2>/dev/null | head -1 || true)"
-    export CC CXX
-fi
+# The headers the ops actually need, verified where nvcc will look for them.
+for h in include/cuda_runtime.h include/thrust/complex.h include/cublas_v2.h; do
+    if [ ! -f "$CUDA_HOME/$h" ]; then
+        echo "ERROR: $CUDA_MODULE is missing $CUDA_HOME/$h" >&2
+        exit 1
+    fi
+done
+step "CUDA headers verified under $CUDA_HOME/include"
 
 export CUDA_HOME="$ENV_DIR"
 export PATH="$CUDA_HOME/bin:$PATH"
@@ -218,8 +234,24 @@ else
 fi
 
 # --- 4. project deps ----------------------------------------------------------
-if have hydra && have ncps && have psutil; then
-    step "project deps present — skipping"
+# Presence is NOT enough. An earlier partial build left ncps at 0.0.2 while the pin
+# says 1.0.1, and a bare `have ncps` check happily skipped the install that would
+# have corrected it -- so the pin silently never applied. ncps 0.0.2 and 1.0.1 do
+# not share an API, and motion.py imports LTC / CfC / AutoNCP from it. Check the
+# pinned versions themselves, not just importability.
+deps_ok() {
+    "$PY" - <<PY >/dev/null 2>&1
+import importlib.metadata as md
+assert md.version("ncps") == "$NCPS_VER"
+assert md.version("numpy") == "$NUMPY_VER"
+assert md.version("hydra-core") == "1.0.7"
+import psutil, pandas, cv2, imageio, scipy
+from moviepy.editor import VideoFileClip
+PY
+}
+
+if deps_ok; then
+    step "project deps present at pinned versions — skipping"
 else
     step "Installing project dependencies"
     # av==9.2.0 is pinned by upstream's environment.yaml but is never imported
@@ -275,10 +307,14 @@ print("  torch<->numpy bridge OK")
 import pkg_resources, setuptools
 print(f"  setuptools  {setuptools.__version__} (pkg_resources present)")
 
+import importlib.metadata as md
 import hydra, omegaconf, ncps, psutil, cv2, imageio, scipy, PIL
 print(f"  hydra       {hydra.__version__}")
 print(f"  omegaconf   {omegaconf.__version__}")
-print(f"  ncps        {ncps.__version__ if hasattr(ncps,'__version__') else 'installed'}")
+# ncps.__version__ is unreliable -- report what pip actually installed, and hold
+# it to the pin. 0.0.2 and 1.0.1 differ in API, and motion.py imports LTC/CfC/AutoNCP.
+print(f"  ncps        {md.version('ncps')}")
+assert md.version("ncps") == "$NCPS_VER", f"ncps {md.version('ncps')} != $NCPS_VER"
 print(f"  cv2         {cv2.__version__}")
 
 from moviepy.editor import VideoFileClip
@@ -292,6 +328,15 @@ assert gate, "gradfix would fall back -- results not comparable to gpuserver02"
 
 from src.training.motion import MotionMappingNetwork
 print("  src.training.motion OK")
+
+# motion.py:22-30 wraps the ncps import in try/except ImportError, so a broken or
+# wrong-version ncps leaves _NCPS_AVAILABLE False and motion.py still imports
+# cleanly. The ncps_ltc / ncps_cfc strategies would then fail at model
+# construction, i.e. after a job is already queued. Assert it here instead.
+from src.training import motion as _m
+print(f"  ncps strategies available: {_m._NCPS_AVAILABLE}")
+assert _m._NCPS_AVAILABLE, (
+    "ncps.torch / ncps.wirings did not import -- gen_strategy=ncps_ltc|ncps_cfc would fail")
 print("\n  CPU-side checks passed.")
 PY
 

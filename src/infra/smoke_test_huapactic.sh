@@ -14,16 +14,22 @@ set -eo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_DIR"
 
+CUDA_MODULE="CUDA/11.1.1-GCC-10.2.0"   # exact match for torch's cu111
+
 module purge
+module load "$CUDA_MODULE"
 module load Anaconda3/2022.05
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$PROJECT_DIR/env"
 
 # A100 = sm_80. Pin it so the extension build does not probe the device.
 export TORCH_CUDA_ARCH_LIST="8.0"
-# nvcc and the host compiler both live in the env (see setup_huapactic.sh).
-export CUDA_HOME="$CONDA_PREFIX"
+# CUDA and gcc come from the module, NOT from conda — see setup_huapactic.sh for
+# why (conda's split cuda-* packages resolve to a mixed 11.8/13.3 toolkit).
+export CUDA_HOME="${EBROOTCUDA:-$CUDA_HOME}"
 export PATH="$CUDA_HOME/bin:$PATH"
+export CC="$(command -v gcc)"
+export CXX="$(command -v g++)"
 # Override to a node-local path to rule out NFS, e.g.
 #   TORCH_EXTENSIONS_DIR=/tmp/te_$USER srun ... bash src/infra/smoke_test_huapactic.sh
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$PROJECT_DIR/.torch_extensions}"

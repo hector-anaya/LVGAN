@@ -22,16 +22,20 @@ torch_extensions_dir: ${env.project_path}/.torch_extensions
 
 before_train_commands:
   - 'module purge'
+  # CUDA 11.1.1 is an exact match for torch 1.9.0+cu111, and the EasyBuild module
+  # pairs it with gcc 10.2.0 — the host compiler CUDA 11.x needs (it rejects
+  # anything newer than gcc 11; the cluster default is 12.2.0).
+  # Do NOT take CUDA from conda here: its split cuda-* packages resolve to a mixed
+  # toolkit (nvcc 11.8 + cudart 13.3 + libcublas 13.6) and lay headers out under
+  # targets/x86_64-linux/ with libs in lib/, not the include//lib64/ that torch's
+  # cpp_extension probes. See src/infra/setup_huapactic.sh.
+  - 'module load CUDA/11.1.1-GCC-10.2.0'
   - 'module load Anaconda3/2022.05'
   - 'source "$(conda info --base)/etc/profile.d/conda.sh"'
   - 'conda activate ${env.project_path}/env'
   # A100 is sm_80. Pin it so the JIT extension build does not probe the device.
   - 'export TORCH_CUDA_ARCH_LIST="8.0"'
-  # nvcc (11.8) and the host compiler (gcc 10) both live inside the conda env, so
-  # the build never depends on which CUDA/GCC modules the cluster happens to have.
-  # torch is cu111: cpp_extension requires the nvcc MAJOR version to match (11) and
-  # only warns about the minor difference. CC/CXX come from conda's compiler
-  # activation scripts, run by the `conda activate` above.
-  - 'export CUDA_HOME="$CONDA_PREFIX"'
+  - 'export CUDA_HOME="${EBROOTCUDA:-$CUDA_HOME}"'
   - 'export PATH="$CUDA_HOME/bin:$PATH"'
+  - 'export CC="$(command -v gcc)"; export CXX="$(command -v g++)"'
   - 'echo "[huapactic] node=$(hostname) allocation:"; nvidia-smi -L'
