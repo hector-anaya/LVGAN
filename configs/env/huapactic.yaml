@@ -37,5 +37,10 @@ before_train_commands:
   - 'export TORCH_CUDA_ARCH_LIST="8.0"'
   - 'export CUDA_HOME="${EBROOTCUDA:-$CUDA_HOME}"'
   - 'export PATH="$CUDA_HOME/bin:$PATH"'
-  - 'export CC="$(command -v gcc)"; export CXX="$(command -v g++)"'
+  # Host compiler stays the conda one that `conda activate` exported CC/CXX for.
+  # The gpu2 node images report glibc-devel installed but ship no
+  # /usr/include/features.h, so the module's gcc cannot compile on a compute node
+  # (it works on the login node, which makes this easy to miss). conda's
+  # gcc_linux-64 carries its own glibc sysroot and works on both.
+  - 'echo "[huapactic] CUDA_HOME=$CUDA_HOME CXX=${CXX:-unset}"'
   - 'echo "[huapactic] node=$(hostname) allocation:"; nvidia-smi -L'

@@ -24,12 +24,17 @@ conda activate "$PROJECT_DIR/env"
 
 # A100 = sm_80. Pin it so the extension build does not probe the device.
 export TORCH_CUDA_ARCH_LIST="8.0"
-# CUDA and gcc come from the module, NOT from conda — see setup_huapactic.sh for
-# why (conda's split cuda-* packages resolve to a mixed 11.8/13.3 toolkit).
+# CUDA from the module (exact 11.1, correct include//lib64/ layout). Host compiler
+# from conda, which `conda activate` above already exported CC/CXX for: the gpu2
+# node images report glibc-devel installed but have no /usr/include/features.h, so
+# the module's gcc cannot compile here. See setup_huapactic.sh for the detail.
 export CUDA_HOME="${EBROOTCUDA:-$CUDA_HOME}"
 export PATH="$CUDA_HOME/bin:$PATH"
-export CC="$(command -v gcc)"
-export CXX="$(command -v g++)"
+if [ -z "${CXX:-}" ] || [ ! -x "${CXX:-/nonexistent}" ]; then
+    CC="$(ls "$PROJECT_DIR"/env/bin/*-linux-gnu-gcc 2>/dev/null | head -1 || true)"
+    CXX="$(ls "$PROJECT_DIR"/env/bin/*-linux-gnu-g++ 2>/dev/null | head -1 || true)"
+    export CC CXX
+fi
 # Override to a node-local path to rule out NFS, e.g.
 #   TORCH_EXTENSIONS_DIR=/tmp/te_$USER srun ... bash src/infra/smoke_test_huapactic.sh
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$PROJECT_DIR/.torch_extensions}"
@@ -62,6 +67,26 @@ for h in include/thrust/complex.h include/cublas_v2.h include/cuda_runtime.h; do
     fi
 done
 echo "== CUDA headers present =="
+
+# Compile a probe ON THIS NODE before spending minutes in ninja. This is what
+# catches the gpu2 image's missing /usr/include/features.h, which the login node
+# cannot reproduce because it has glibc-devel properly installed.
+PROBE="$(mktemp -d)"
+cat > "$PROBE/probe.cpp" <<'EOF'
+#include <features.h>
+#include <cuda_runtime.h>
+#include <thrust/complex.h>
+int main() { return 0; }
+EOF
+if "$CXX" -I"$CUDA_HOME/include" -c "$PROBE/probe.cpp" -o "$PROBE/probe.o" 2>"$PROBE/err"; then
+    echo "== probe compile OK on $(hostname) =="
+else
+    echo "ERROR: probe compile failed on $(hostname) with CXX=$CXX" >&2
+    cat "$PROBE/err" >&2
+    rm -rf "$PROBE"
+    exit 1
+fi
+rm -rf "$PROBE"
 
 python -u - <<'PY'
 import time

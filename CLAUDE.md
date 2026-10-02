@@ -39,8 +39,14 @@ upstream leftovers and do not reproduce this env.
   to CUDA 13, producing nvcc 11.8 + cudart 13.3 + libcublas 13.6 in one prefix. conda
   also lays CUDA out as `targets/x86_64-linux/{include,lib}` rather than the
   `include/` + `lib64/` that torch's `cpp_extension` probes, which is what produces
-  `No CUDA runtime is found`. Likewise do not install `gcc_linux-64` — its `activate.d`
-  scripts export `CC`/`CXX` on every activation and would override the module's gcc.
+  `No CUDA runtime is found`.
+  **But the host compiler must come from conda** (`gcc_linux-64=10` +
+  `sysroot_linux-64`), not from the module. The `gpu2` node images are broken:
+  `rpm -q glibc-devel` reports it installed while `/usr/include/features.h` is absent,
+  so the module's gcc fails on `ampere0N` with `crt/host_config.h:208: fatal error:
+  features.h`. The login node *does* have the header, so this cannot be reproduced on
+  LNSHEAD — it only shows up inside an allocation. conda's gcc carries its own glibc
+  sysroot and works on both. Revisit if the admins ever fix the compute image.
 - **gpuserver02 (INAOE)** — [configs/env/local.yaml](configs/env/local.yaml). Carries a
   dead-GPU guard for a specific UUID; do not copy that to other clusters.
 

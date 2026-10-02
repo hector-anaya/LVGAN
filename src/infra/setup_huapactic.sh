@@ -165,54 +165,97 @@ else
     step "pkg_resources available — skipping setuptools pin"
 fi
 
-# --- 2. purge conda's CUDA and compilers --------------------------------------
-# CUDA and gcc now come from $CUDA_MODULE. Any conda copies must go, for two
-# reasons beyond mere redundancy:
-#   1. The conda CUDA set is internally inconsistent (nvcc 11.8 + cudart 13.3 +
-#      libcublas 13.6, all held together by a cuda-version 13.3 metapackage).
-#   2. gcc_linux-64's activate.d scripts EXPORT CC/CXX on every activation, which
-#      would silently override the module's gcc 10.2.0 and point nvcc back at a
-#      compiler it was never paired with.
-# --force-remove because the broken CUDA set's own dependency graph is what got
-# us here; we are deleting it wholesale, not satisfying it.
+# --- 2a. purge conda's CUDA (but NOT its compilers) ---------------------------
+# CUDA comes from $CUDA_MODULE. conda's copy must go: its split cuda-* packages
+# resolve to an internally inconsistent set (nvcc 11.8 + cudart 13.3 + libcublas
+# 13.6, held together by a cuda-version 13.3 metapackage), and leaving CUDA 13
+# libs in env/lib risks a build that compiles against 11.1 headers and then
+# resolves against 13.3 at load time.
+# --force-remove because that broken dependency graph is what we are deleting,
+# not something to satisfy.
 CONDA_CUDA_PKGS="$(conda list -p "$ENV_DIR" 2>/dev/null \
-    | awk '$1 ~ /^(cuda|libcublas|libcufft|libcurand|libcusolver|libcusparse|libnvjitlink|gcc_linux|gxx_linux|binutils_linux|sysroot_linux)/ {print $1}' \
+    | awk '$1 ~ /^(cuda|libcublas|libcufft|libcurand|libcusolver|libcusparse|libnvjitlink)/ {print $1}' \
     | tr '\n' ' ')"
 
 if [ -n "$(echo "$CONDA_CUDA_PKGS" | tr -d '[:space:]')" ]; then
-    step "Removing conda CUDA/compiler packages (module provides these):"
+    step "Removing conda CUDA packages (the module provides CUDA):"
     echo "    $CONDA_CUDA_PKGS"
     conda remove -y -p "$ENV_DIR" --force-remove $CONDA_CUDA_PKGS || \
         echo "    (some were already absent — continuing)"
 else
-    step "no conda CUDA/compiler packages to remove — skipping"
+    step "no conda CUDA packages to remove — skipping"
 fi
 
-# Host compiler comes from the CUDA module's GCC. Clear anything conda may still
-# be exporting so cpp_extension does not pick up a stale conda toolchain.
-unset CC CXX
-export CC="$(command -v gcc)"
-export CXX="$(command -v g++)"
-step "CC=$CC ($("$CC" -dumpversion))"
-step "CXX=$CXX"
+# --- 2b. host compiler from conda (NOT from the module) -----------------------
+# The gpu2 compute node images are broken: `rpm -q glibc-devel` reports it
+# installed, but /usr/include/features.h is absent. The login node has it. So the
+# module's gcc compiles fine on LNSHEAD and fails on ampere0N with
+#   crt/host_config.h:208: fatal error: features.h: No such file or directory
+# conda's gcc_linux-64 ships its own glibc sysroot, so it does not consult
+# /usr/include at all and works on both. Hence the split: CUDA from the module
+# (exact 11.1, correct include//lib64/ layout), compiler from conda (portable
+# across node images). Remove this only once the admins fix the compute image.
+if [ -n "$(ls "$ENV_DIR"/bin/*-linux-gnu-g++ 2>/dev/null || true)" ]; then
+    step "conda compiler present — skipping"
+else
+    step "Installing conda gcc/g++ 10 + glibc sysroot (compute nodes lack features.h)"
+    conda install -y -c conda-forge \
+        "gcc_linux-64=10" "gxx_linux-64=10" "sysroot_linux-64=2.17"
+fi
 
+# Re-activate so conda's compiler activation scripts export CC/CXX and the
+# sysroot-aware CFLAGS. Here that export is exactly what we want.
+conda_off
+conda_on "$ENV_DIR"
+
+if [ -z "${CXX:-}" ] || [ ! -x "${CXX:-/nonexistent}" ]; then
+    CC="$(ls "$ENV_DIR"/bin/*-linux-gnu-gcc 2>/dev/null | head -1 || true)"
+    CXX="$(ls "$ENV_DIR"/bin/*-linux-gnu-g++ 2>/dev/null | head -1 || true)"
+    export CC CXX
+fi
+step "CC=${CC:-<unset>} ($("${CC:-false}" -dumpversion 2>/dev/null || echo '?'))"
+step "CXX=${CXX:-<unset>}"
+
+if [ -z "${CXX:-}" ] || [ ! -x "$CXX" ]; then
+    echo "ERROR: no conda host compiler in $ENV_DIR/bin." >&2
+    exit 1
+fi
+
+# CUDA 11.1's crt/host_config.h rejects __GNUC__ > 10.
 case "$("$CC" -dumpversion)" in
-    1[2-9]*|[2-9][0-9]*)
-        echo "ERROR: gcc $("$CC" -dumpversion) is too new for CUDA 11.x (needs <= 11)." >&2
-        echo "       $CUDA_MODULE should have supplied gcc 10.2.0 — check 'module list'." >&2
+    1[1-9]*|[2-9][0-9]*)
+        echo "ERROR: gcc $("$CC" -dumpversion) is too new for CUDA 11.1 (needs <= 10)." >&2
         exit 1 ;;
 esac
 
-# The headers the ops actually need, verified where nvcc will look for them.
+# --- 2c. verify headers are reachable, not merely present ---------------------
 for h in include/cuda_runtime.h include/thrust/complex.h include/cublas_v2.h; do
     if [ ! -f "$CUDA_HOME/$h" ]; then
         echo "ERROR: $CUDA_MODULE is missing $CUDA_HOME/$h" >&2
         exit 1
     fi
 done
-step "CUDA headers verified under $CUDA_HOME/include"
+step "CUDA headers present under $CUDA_HOME/include"
 
-export CUDA_HOME="$ENV_DIR"
+# Existence is not reachability: the whole features.h problem was a header that
+# the compiler could not find. Actually compile something that needs both the
+# glibc sysroot and the CUDA headers.
+TMPC="$(mktemp -d)"
+cat > "$TMPC/probe.cpp" <<'EOF'
+#include <features.h>
+#include <cuda_runtime.h>
+#include <thrust/complex.h>
+int main() { return 0; }
+EOF
+if "$CXX" -I"$CUDA_HOME/include" -c "$TMPC/probe.cpp" -o "$TMPC/probe.o" 2>"$TMPC/err"; then
+    step "probe compile OK (features.h + cuda_runtime.h + thrust/complex.h)"
+else
+    echo "ERROR: probe compile failed:" >&2
+    cat "$TMPC/err" >&2
+    rm -rf "$TMPC"
+    exit 1
+fi
+rm -rf "$TMPC"
 export PATH="$CUDA_HOME/bin:$PATH"
 step "CC=${CC:-<unset>}"
 step "CXX=${CXX:-<unset>}"
