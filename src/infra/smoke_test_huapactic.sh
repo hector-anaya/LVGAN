@@ -98,17 +98,29 @@ from src.torch_utils.ops import bias_act, upfirdn2d
 x = torch.randn(4, 8, 16, 16, device="cuda")
 b = torch.randn(8, device="cuda")
 y = bias_act.bias_act(x, b, act="lrelu")
-print("bias_act          :", tuple(y.shape), "OK")
+print("bias_act          :", tuple(y.shape))
 lap("build+run bias_act")
 
 f = upfirdn2d.setup_filter([1, 3, 3, 1], device="cuda")
 z = upfirdn2d.upsample2d(x, f)
-print("upfirdn2d         :", tuple(z.shape), "OK")
+print("upfirdn2d         :", tuple(z.shape))
 lap("build+run upfirdn2d")
+
+# Shapes are NOT proof. Both ops catch a failed build, warn, and silently fall back
+# to a pure-PyTorch reference implementation that returns identical shapes -- and is
+# far slower. The compiled plugin is the thing being tested, so assert it loaded.
+assert bias_act._plugin is not None, \
+    "bias_act fell back to the slow reference implementation -- the CUDA build failed"
+assert upfirdn2d._plugin is not None, \
+    "upfirdn2d fell back to the slow reference implementation -- the CUDA build failed"
+print("both plugins      : compiled (not the fallback)")
 
 # conv2d_gradfix must take the custom path, not the F.conv2d fallback -- that is
 # the whole reason this env is pinned to torch 1.9 (see conv2d_gradfix.py:53).
 from src.torch_utils.ops import conv2d_gradfix
+# conv2d_gradfix.py:22 defaults `enabled = False`; training_loop.py:203 flips it on.
+# Without this the check below fails for a reason that has nothing to do with the env.
+conv2d_gradfix.enabled = True
 assert conv2d_gradfix._should_use_custom_op(x), \
     "conv2d_gradfix fell back to F.conv2d -- not comparable to the gpuserver02 runs"
 print("conv2d_gradfix    : custom op active")
