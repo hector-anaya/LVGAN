@@ -30,11 +30,18 @@ export TORCH_CUDA_ARCH_LIST="8.0"
 # the module's gcc cannot compile here. See setup_huapactic.sh for the detail.
 export CUDA_HOME="${EBROOTCUDA:-$CUDA_HOME}"
 export PATH="$CUDA_HOME/bin:$PATH"
-if [ -z "${CXX:-}" ] || [ ! -x "${CXX:-/nonexistent}" ]; then
-    CC="$(ls "$PROJECT_DIR"/env/bin/*-linux-gnu-gcc 2>/dev/null | head -1 || true)"
-    CXX="$(ls "$PROJECT_DIR"/env/bin/*-linux-gnu-g++ 2>/dev/null | head -1 || true)"
-    export CC CXX
-fi
+# Prefer the modern `conda-linux-gnu` triplet over the legacy `conda_cos6` one: a
+# stale old compiler left in bin/ would otherwise shadow the working toolchain, and
+# the legacy one may have no sysroot (hence no features.h).
+pick_tool() {   # $1 = gcc|g++
+    if [ -x "$PROJECT_DIR/env/bin/x86_64-conda-linux-gnu-$1" ]; then
+        echo "$PROJECT_DIR/env/bin/x86_64-conda-linux-gnu-$1"
+    else
+        ls "$PROJECT_DIR"/env/bin/*-linux-gnu-"$1" 2>/dev/null | head -1
+    fi
+}
+CC="$(pick_tool gcc)"; CXX="$(pick_tool g++)"
+export CC CXX
 # Override to a node-local path to rule out NFS, e.g.
 #   TORCH_EXTENSIONS_DIR=/tmp/te_$USER srun ... bash src/infra/smoke_test_huapactic.sh
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$PROJECT_DIR/.torch_extensions}"

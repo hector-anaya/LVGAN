@@ -195,34 +195,72 @@ fi
 # /usr/include at all and works on both. Hence the split: CUDA from the module
 # (exact 11.1, correct include//lib64/ layout), compiler from conda (portable
 # across node images). Remove this only once the admins fix the compute image.
-if [ -n "$(ls "$ENV_DIR"/bin/*-linux-gnu-g++ 2>/dev/null || true)" ]; then
-    step "conda compiler present — skipping"
+# The condition is a COMPILE, not the presence of a compiler binary. conda's
+# gcc_linux-64 is inert without its matching sysroot_linux-64: it does not consult
+# /usr/include by design, so a gcc whose sysroot was removed cannot find features.h
+# even on the login node, where /usr/include/features.h exists. An earlier revision
+# of this script purged sysroot_linux-64 and left the compiler, producing exactly
+# that. Globbing for *-g++ reported "present" and skipped the fix.
+PROBE_ERR=""
+probe_cxx() {
+    [ -n "${1:-}" ] && [ -x "${1:-/nonexistent}" ] || return 1
+    local d rc=0
+    d="$(mktemp -d)"
+    cat > "$d/probe.cpp" <<'EOF'
+#include <features.h>
+#include <cuda_runtime.h>
+#include <thrust/complex.h>
+int main() { return 0; }
+EOF
+    "$1" -I"$CUDA_HOME/include" -c "$d/probe.cpp" -o "$d/probe.o" 2>"$d/err" || rc=1
+    PROBE_ERR="$(cat "$d/err" 2>/dev/null)"
+    rm -rf "$d"
+    return $rc
+}
+
+# Prefer the modern `conda-linux-gnu` triplet over the legacy `conda_cos6` one, so
+# a stale old compiler left in bin/ does not shadow a freshly installed toolchain.
+pick_tool() {   # $1 = gcc|g++
+    if [ -x "$ENV_DIR/bin/x86_64-conda-linux-gnu-$1" ]; then
+        echo "$ENV_DIR/bin/x86_64-conda-linux-gnu-$1"
+    else
+        ls "$ENV_DIR"/bin/*-linux-gnu-"$1" 2>/dev/null | head -1
+    fi
+}
+
+if probe_cxx "$(pick_tool g++)"; then
+    step "conda compiler + sysroot already working — skipping install"
 else
-    step "Installing conda gcc/g++ 10 + glibc sysroot (compute nodes lack features.h)"
-    conda install -y -c conda-forge \
+    step "Rebuilding the conda toolchain (probe failed: compiler or sysroot missing)"
+    # Remove BOTH halves first, then install as a set. The env may hold a legacy
+    # `conda_cos6` compiler, whose sysroot it expects at
+    #   env/x86_64-conda_cos6-linux-gnu/sysroot
+    # while sysroot_linux-64 2.17 installs to
+    #   env/x86_64-conda-linux-gnu/sysroot
+    # -- a directory that compiler never searches. So adding the sysroot alone
+    # cannot fix a cos6 gcc, and leaving the old package in place lets the solver
+    # call the spec "already satisfied" and change nothing. Clearing first
+    # guarantees a matched compiler/sysroot pair.
+    OLD_TC="$(conda list -p "$ENV_DIR" 2>/dev/null \
+        | awk '$1 ~ /^(gcc_linux-64|gxx_linux-64|gfortran_linux-64|binutils_linux-64|sysroot_linux-64)$/ {print $1}' \
+        | tr '\n' ' ')"
+    if [ -n "$(echo "$OLD_TC" | tr -d '[:space:]')" ]; then
+        echo "    removing stale toolchain: $OLD_TC"
+        conda remove -y -p "$ENV_DIR" --force-remove $OLD_TC || true
+    fi
+    conda install -y -p "$ENV_DIR" -c conda-forge \
         "gcc_linux-64=10" "gxx_linux-64=10" "sysroot_linux-64=2.17"
+    conda_off
+    conda_on "$ENV_DIR"
 fi
 
-# Re-activate so conda's compiler activation scripts export CC/CXX and the
-# sysroot-aware CFLAGS. Here that export is exactly what we want.
-conda_off
-conda_on "$ENV_DIR"
-
-if [ -z "${CXX:-}" ] || [ ! -x "${CXX:-/nonexistent}" ]; then
-    CC="$(ls "$ENV_DIR"/bin/*-linux-gnu-gcc 2>/dev/null | head -1 || true)"
-    CXX="$(ls "$ENV_DIR"/bin/*-linux-gnu-g++ 2>/dev/null | head -1 || true)"
-    export CC CXX
-fi
+CC="$(pick_tool gcc)"; CXX="$(pick_tool g++)"
+export CC CXX
 step "CC=${CC:-<unset>} ($("${CC:-false}" -dumpversion 2>/dev/null || echo '?'))"
 step "CXX=${CXX:-<unset>}"
 
-if [ -z "${CXX:-}" ] || [ ! -x "$CXX" ]; then
-    echo "ERROR: no conda host compiler in $ENV_DIR/bin." >&2
-    exit 1
-fi
-
 # CUDA 11.1's crt/host_config.h rejects __GNUC__ > 10.
-case "$("$CC" -dumpversion)" in
+case "$("$CC" -dumpversion 2>/dev/null)" in
     1[1-9]*|[2-9][0-9]*)
         echo "ERROR: gcc $("$CC" -dumpversion) is too new for CUDA 11.1 (needs <= 10)." >&2
         exit 1 ;;
@@ -237,25 +275,14 @@ for h in include/cuda_runtime.h include/thrust/complex.h include/cublas_v2.h; do
 done
 step "CUDA headers present under $CUDA_HOME/include"
 
-# Existence is not reachability: the whole features.h problem was a header that
-# the compiler could not find. Actually compile something that needs both the
-# glibc sysroot and the CUDA headers.
-TMPC="$(mktemp -d)"
-cat > "$TMPC/probe.cpp" <<'EOF'
-#include <features.h>
-#include <cuda_runtime.h>
-#include <thrust/complex.h>
-int main() { return 0; }
-EOF
-if "$CXX" -I"$CUDA_HOME/include" -c "$TMPC/probe.cpp" -o "$TMPC/probe.o" 2>"$TMPC/err"; then
+if probe_cxx "$CXX"; then
     step "probe compile OK (features.h + cuda_runtime.h + thrust/complex.h)"
 else
-    echo "ERROR: probe compile failed:" >&2
-    cat "$TMPC/err" >&2
-    rm -rf "$TMPC"
+    echo "ERROR: probe compile still failing after installing the toolchain:" >&2
+    echo "$PROBE_ERR" >&2
+    echo "       CXX=$CXX  CUDA_HOME=$CUDA_HOME" >&2
     exit 1
 fi
-rm -rf "$TMPC"
 export PATH="$CUDA_HOME/bin:$PATH"
 step "CC=${CC:-<unset>}"
 step "CXX=${CXX:-<unset>}"
