@@ -15,3 +15,11 @@ notebooks/zoo.ipynb
 checkpoints/
 notebooks/
 evaluation/
+
+# Windows / Visual Studio artifacts
+desktop.ini
+.vs/
+
+# Local notes: only README.md is published
+*.md
+!README.md
