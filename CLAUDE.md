@@ -8,21 +8,92 @@ StyleGAN-V (CVPR 2022) is a continuous video generator that extends StyleGAN2. I
 
 ## Environment Setup
 
-```bash
-# Standard GPUs (V100, CUDA 10.1)
-conda env create -f environment.yaml -p env
-conda activate ./env
+### The pins that actually work — do not guess, do not "modernize"
 
-# Ampere GPUs (A6000, A100, RTX-3090, CUDA 11.1)
-conda env create -f environment-ampere.yaml -p env
-conda activate ./env
+Every completed run used this exact set. It is the reference for any new machine:
+
+```
+python 3.9   torch 1.9.0+cu111   torchvision 0.10.0+cu111   numpy 1.22.4
+hydra-core 1.0.7   omegaconf 2.0.6   ncps 1.0.1
 ```
 
-If CUDA kernels (`bias_act`, `upfirdn2d`) fail to compile on older GPUs:
+**Never substitute a newer torch.** [conv2d_gradfix.py:53](src/torch_utils/ops/conv2d_gradfix.py#L53)
+gates the custom op on `['1.7.','1.8.','1.9','1.10']`. On torch 1.9 it is *enabled*; on
+2.x it silently falls back to `F.conv2d`, changing the kernels used for the R1
+double-backward. Results stop being comparable to existing runs and nothing warns you
+beyond one `warnings.warn`. `environment-ampere.yaml` and `environment.yaml` are
+upstream leftovers and do not reproduce this env.
+
+### Per-machine setup scripts
+
+- **Huapáctic (LNS-BUAP)** — [src/infra/setup_huapactic.sh](src/infra/setup_huapactic.sh),
+  then [src/infra/smoke_test_huapactic.sh](src/infra/smoke_test_huapactic.sh) on a `gpu2`
+  node. Config: [configs/env/huapactic.yaml](configs/env/huapactic.yaml).
+  `gpu2` = `ampere[01-05]`, 4×A100-80GB each, 96 CPU, 1TB RAM, 15-day walltime.
+  Launch with `env=huapactic sbatch_args.partition=gpu2` (without the partition it lands
+  on `normal*`, which has no GPUs).
+  **CUDA and gcc come from `module load CUDA/11.1.1-GCC-10.2.0`** — an exact match for
+  `cu111`, EasyBuild-paired with the gcc 10.2.0 that CUDA 11.x requires. Take CUDA from
+  the module, never from conda: conda's `cuda-libraries-dev=11.8.0` is an old-style
+  metapackage whose `*_linux-64` dependencies track `cuda-version` and silently resolve
+  to CUDA 13, producing nvcc 11.8 + cudart 13.3 + libcublas 13.6 in one prefix. conda
+  also lays CUDA out as `targets/x86_64-linux/{include,lib}` rather than the
+  `include/` + `lib64/` that torch's `cpp_extension` probes, which is what produces
+  `No CUDA runtime is found`.
+  **But the host compiler must come from conda** (`gcc_linux-64=10` +
+  `sysroot_linux-64`), not from the module. The `gpu2` node images are broken:
+  `rpm -q glibc-devel` reports it installed while `/usr/include/features.h` is absent,
+  so the module's gcc fails on `ampere0N` with `crt/host_config.h:208: fatal error:
+  features.h`. The login node *does* have the header, so this cannot be reproduced on
+  LNSHEAD — it only shows up inside an allocation. conda's gcc carries its own glibc
+  sysroot and works on both. Revisit if the admins ever fix the compute image.
+- **gpuserver02 (INAOE)** — [configs/env/local.yaml](configs/env/local.yaml). Carries a
+  dead-GPU guard for a specific UUID; do not copy that to other clusters.
+
+### Verifying an environment: check correctness, not existence
+
+Six setup failures on Huapáctic all came from checks that confirmed a thing was *present*
+rather than *right*. When writing or reviewing an env check:
+
+- **Pinned packages** — compare `importlib.metadata.version(...)` against the pin.
+  `import ncps` succeeded at 0.0.2 while the pin said 1.0.1, so the fixing install was skipped.
+- **`ncps` specifically** — [motion.py:22-30](src/training/motion.py#L22-L30) wraps the import
+  in `try/except ImportError`, so a wrong version leaves `_NCPS_AVAILABLE = False` and
+  `motion.py` still imports cleanly. `gen_strategy=ncps_ltc|ncps_cfc` then fails at model
+  construction, after the job is queued. Assert `_NCPS_AVAILABLE`, not the import.
+- **CUDA headers** — do not size the toolkit by grepping the ops' own `#include`s. They pull
+  torch headers that reach further: `bias_act.cu` → `c10/util/complex.h` → `<thrust/complex.h>`,
+  and the `.cpp` files → `ATen/cuda/CUDAContext.h` → `<cusparse.h>`, `<cublas_v2.h>`. Check for
+  those header files under `$CUDA_HOME/include`, not for the presence of `nvcc`.
+- **torch↔numpy** — `import torch` only *warns* when the NumPy bridge is dead. Test
+  functionally with `torch.from_numpy(...)`. torch 1.9 requires `numpy<2`.
+- **CUDA ops** — compiling is not working. The GPU smoke test must also exercise a
+  double-backward through `conv2d_gradfix.conv2d`, the path R1/PL regularization uses.
+
+### Known packaging traps (2022 pins vs. a current index)
+
+| Trap | Why |
+|---|---|
+| `pip<24.1` | omegaconf 2.0.6 declares `PyYAML (>=5.1.*)`; pip ≥24.1 rejects that metadata, making hydra 1.0.7 uninstallable. Upgrading hydra is a config migration — the configs use hydra 1.0 `# @package _group_` semantics. |
+| `setuptools<81` | setuptools ≥81 dropped `pkg_resources`, which torch's `cpp_extension` imports at module scope. Breaks *every* custom-op import. |
+| `moviepy<2` | moviepy 2.0 removed `moviepy.editor`, imported by `convert_video_to_dataset.py`. |
+| `numpy<2` via a **constraints file** | Per-install pins ping-pong: opencv (4.10+ and 5.x) declares `numpy>=2` and will drag it back. Use `PIP_CONSTRAINT` + `env/pip.conf` so every resolution honours it. |
+| `psutil`, `pandas` | Imported by `training_loop.py` and `preprocess_ffs.py`; missing from upstream's yaml. |
+| drop `av` | Pinned upstream but never imported here (mp4 goes through `cv2.VideoWriter`). Its sdist needs ffmpeg dev headers and root. |
+| no `set -u` in setup scripts | conda's compiler `activate.d`/`deactivate.d` scripts read `$ADDR2LINE`, `$CONDA_BACKUP_CXX` by design. The conda shell function re-sources them after *every* `install`/`update`/`remove`, not just `activate`. |
+
+### JIT-compiled CUDA ops
+
 ```bash
-export TORCH_CUDA_ARCH_LIST="7.0"
-export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
+export TORCH_CUDA_ARCH_LIST="8.0"   # A100 (sm_80); "7.0" for V100
 ```
+
+A job killed mid-build (SLURM time limit, Ctrl-C) leaves a `FileBaton` lock in
+`TORCH_EXTENSIONS_DIR`. [custom_ops.py:105](src/torch_utils/custom_ops.py#L105) and torch's
+own `_jit_compile` then `baton.wait()` **forever** on a lock nobody holds — the retry hangs
+instead of rebuilding. Delete stale `lock` files before re-running. `custom_ops.verbosity`
+defaults to `'brief'`, which passes `verbose=False` to `cpp_extension.load()`, so a slow
+build and a deadlock look identical; set it to `'full'` when diagnosing.
 
 ## Common Commands
 
@@ -219,8 +290,9 @@ python src/infra/launch.py hydra.run.dir=. exp_suffix=my_exp env=local dataset=f
 CfC needs no `ode_unfolds` — each step is a single closed-form update rather than an
 inner ODE loop. `cfc_hidden_dim` defaults to `motion.z_dim` if omitted.
 
-To train with the reference `ncps` implementations (requires `pip install ncps`;
-verified against **ncps 0.0.2**):
+To train with the reference `ncps` implementations (requires **`ncps==1.0.1`** — the
+version all completed runs used; earlier docs said 0.0.2, which is wrong and has an
+incompatible API):
 
 ```bash
 # ncps CfC — backbone defaults to hidden_dim, not ncps' 128, to keep capacity comparable
